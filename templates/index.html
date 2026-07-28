@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Hygd — Event Schedule</title>
+
+  <!-- Bootstrap 5 -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css">
+  <!-- Bootstrap Icons -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css">
+  <!-- FullCalendar 6 -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/fullcalendar@6.1.14/index.global.min.css">
+
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<!-- ── Top navigation bar ─────────────────────────────────────────────────── -->
+<header class="app-header d-flex align-items-center px-4">
+  <div class="d-flex align-items-center gap-3 flex-grow-1">
+    <span class="header-logo">
+      <i class="bi bi-calendar2-week"></i>
+    </span>
+    <div>
+      <h1 class="header-title mb-0">Hygd</h1>
+      <p class="header-sub mb-0">Daily event &amp; room schedule</p>
+    </div>
+  </div>
+
+  <div class="d-flex align-items-center gap-2 header-actions">
+    <span id="identity" class="header-identity"></span>
+    <span id="event-count-badge" class="badge bg-secondary fs-6 px-3 py-2">0 events</span>
+    <button class="btn btn-outline-light" onclick="App.toggleGrouped()" id="grouped-btn"
+            title="Group events by client booking">
+      <i class="bi bi-diagram-3 me-1"></i><span class="btn-label">Grouped</span>
+    </button>
+    <button class="btn btn-outline-light" onclick="App.toggleLegend()" id="legend-btn"
+            title="Show colour legend">
+      <i class="bi bi-palette me-1"></i><span class="btn-label">Legend</span>
+    </button>
+    <button class="btn btn-outline-light" onclick="App.toggleHidden()" id="hidden-btn"
+            title="Show events that have been hidden">
+      <i class="bi bi-eye-slash me-1"></i><span class="btn-label">Show hidden</span>
+    </button>
+    <button class="btn btn-outline-light" onclick="App.togglePast()" id="past-btn"
+            title="Show events whose last instance has already passed">
+      <i class="bi bi-clock-history me-1"></i><span class="btn-label">Show past</span>
+    </button>
+    <button class="btn btn-primary" onclick="App.openUpload()" title="Upload a PDF report">
+      <i class="bi bi-cloud-upload me-1"></i><span class="btn-label">Upload PDF</span>
+    </button>
+    <button class="btn btn-outline-danger" onclick="App.openClear()" title="Clear events">
+      <i class="bi bi-trash3 me-1"></i><span class="btn-label">Clear</span>
+    </button>
+  </div>
+</header>
+
+<!-- ── Filter toolbar ──────────────────────────────────────────────────────── -->
+<div id="filter-bar" class="filter-bar">
+  <div class="filter-group filter-group-grow">
+    <span class="filter-label"><i class="bi bi-people me-1"></i>Department</span>
+    <div id="dept-filters" class="dept-chips"></div>
+  </div>
+  <div class="filter-group">
+    <span class="filter-label"><i class="bi bi-geo-alt me-1"></i>Room</span>
+    <select id="room-filter" class="form-select form-select-sm room-select"
+            onchange="App.setRoom(this.value)">
+      <option value="">All rooms</option>
+    </select>
+  </div>
+  <button id="clear-filters" class="btn btn-sm clear-filters d-none"
+          onclick="App.clearFilters()">
+    <i class="bi bi-x-circle me-1"></i>Clear
+  </button>
+  <span id="filter-count" class="filter-count"></span>
+</div>
+
+<!-- ── Legend strip ────────────────────────────────────────────────────────── -->
+<div id="legend-bar" class="legend-bar d-none">
+  <div id="legend-chips" class="legend-chips"></div>
+</div>
+
+<!-- ── Calendar ────────────────────────────────────────────────────────────── -->
+<main id="calendar-wrap">
+  <div id="calendar"></div>
+
+  <!-- Grouped-view toolbar — mirrors the calendar's range controls so you can
+       tell (and change) which range of events you're looking at. -->
+  <div id="grouped-toolbar" class="grouped-toolbar d-none">
+    <div class="gt-nav">
+      <button class="gt-btn" onclick="App.groupedPrev()" title="Previous"><i class="bi bi-chevron-left"></i></button>
+      <button class="gt-btn" onclick="App.groupedNext()" title="Next"><i class="bi bi-chevron-right"></i></button>
+      <button class="gt-btn gt-today" onclick="App.groupedToday()">Today</button>
+    </div>
+    <div id="grouped-title" class="gt-title"></div>
+    <div class="gt-views">
+      <button class="gt-btn" data-range="listDay"     onclick="App.groupedRange('listDay')">Day</button>
+      <button class="gt-btn" data-range="listWeek"    onclick="App.groupedRange('listWeek')">Week</button>
+      <button class="gt-btn" data-range="dayGridMonth" onclick="App.groupedRange('dayGridMonth')">Month</button>
+    </div>
+  </div>
+
+  <div id="grouped-panel" class="grouped-panel d-none"></div>
+</main>
+
+<!-- ══════════════════════════════════════════════════════════════════════════
+     UPLOAD MODAL
+══════════════════════════════════════════════════════════════════════════ -->
+<div class="modal fade" id="uploadModal" tabindex="-1" aria-labelledby="uploadModalLabel">
+  <div class="modal-dialog modal-dialog-centered">
+    <div class="modal-content">
+
+      <div class="modal-header">
+        <h5 class="modal-title" id="uploadModalLabel">
+          <i class="bi bi-file-earmark-pdf me-2" style="color:#4f46e5"></i>Upload Event PDF
+        </h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+
+      <div class="modal-body">
+        <!-- Alert area -->
+        <div id="upload-alert"></div>
+
+        <!-- Drop zone -->
+        <div id="drop-zone" class="drop-zone" onclick="document.getElementById('file-input').click()">
+          <i class="bi bi-file-earmark-arrow-up drop-icon"></i>
+          <p class="mb-1 fw-semibold">Drop PDF here or click to browse</p>
+          <p class="text-muted small mb-0">Supports MECS "Daily Resources by Space", "by Setup Time" &amp; "Services by Function Date" reports</p>
+          <input type="file" id="file-input" accept=".pdf" class="d-none">
+        </div>
+
+        <!-- Progress indicator (hidden until upload starts) -->
+        <div id="upload-progress" class="d-none text-center py-3">
+          <div class="spinner-border text-primary mb-3" role="status"></div>
+          <p class="mb-0 fw-semibold">Extracting events …</p>
+          <p class="text-muted small">This may take 30–60 seconds for large PDFs.</p>
+        </div>
+      </div>
+
+    </div>
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════════════════════════════════════════
+     EVENT DETAIL MODAL
+══════════════════════════════════════════════════════════════════════════ -->
+<div class="modal fade" id="eventModal" tabindex="-1" aria-labelledby="eventModalLabel">
+  <div class="modal-dialog modal-lg modal-dialog-scrollable">
+    <div class="modal-content">
+
+      <div class="modal-header" id="event-modal-header">
+        <div>
+          <h5 class="modal-title" id="eventModalLabel"></h5>
+          <p class="modal-subtitle mb-0" id="event-modal-sub"></p>
+        </div>
+        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+
+      <div class="modal-body" id="event-modal-body"></div>
+
+      <div class="modal-footer border-top-0 pt-0">
+        <button class="btn btn-outline-danger btn-sm me-auto" onclick="App.deleteCurrentEvent()">
+          <i class="bi bi-trash3 me-1"></i>Delete this event
+        </button>
+        <button class="btn btn-outline-secondary btn-sm" id="hide-btn" onclick="App.toggleCurrentHidden()">
+          <i class="bi bi-eye-slash me-1"></i>Hide
+        </button>
+        <button type="button" class="btn btn-secondary btn-sm" data-bs-dismiss="modal">Close</button>
+      </div>
+
+    </div>
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════════════════════════════════════════
+     CLEAR MODAL
+══════════════════════════════════════════════════════════════════════════ -->
+<div class="modal fade" id="clearModal" tabindex="-1" aria-labelledby="clearModalLabel">
+  <div class="modal-dialog modal-dialog-centered">
+    <div class="modal-content">
+
+      <div class="modal-header clear-header">
+        <div>
+          <h5 class="modal-title" id="clearModalLabel">
+            <i class="bi bi-trash3 me-2"></i>Clear Events
+          </h5>
+          <p class="modal-subtitle mb-0">Choose a date range to remove from the calendar</p>
+        </div>
+        <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+      </div>
+
+      <div class="modal-body p-4">
+
+        <!-- Date range inputs -->
+        <div class="row g-3 mb-3">
+          <div class="col-6">
+            <label class="form-label fw-semibold small">From</label>
+            <input type="date" class="form-control" id="clear-start">
+          </div>
+          <div class="col-6">
+            <label class="form-label fw-semibold small">To</label>
+            <input type="date" class="form-control" id="clear-end">
+          </div>
+        </div>
+
+        <!-- Live count feedback -->
+        <div id="clear-count-msg" class="clear-count-msg d-none"></div>
+
+      </div>
+
+      <div class="modal-footer flex-column align-items-stretch gap-2">
+        <button class="btn btn-danger w-100" id="clear-range-btn"
+                onclick="App.clearRange()" disabled>
+          <i class="bi bi-trash3 me-1"></i>
+          <span id="clear-range-label">Clear events in range</span>
+        </button>
+        <hr class="my-1 w-100">
+        <button class="btn btn-outline-secondary btn-sm w-100"
+                onclick="App.clearAll()">
+          Clear <strong>all</strong> events in the calendar
+        </button>
+      </div>
+
+    </div>
+  </div>
+</div>
+
+<!-- Bootstrap JS -->
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+<!-- FullCalendar -->
+<script src="https://cdn.jsdelivr.net/npm/fullcalendar@6.1.14/index.global.min.js"></script>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
