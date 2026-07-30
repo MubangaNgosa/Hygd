@@ -25,6 +25,16 @@ No external API or cloud service required. Everything runs locally on your Linux
 
 ---
 
+## Changelog
+
+### 2026-07-30 — Checkpoint: layout diagrams match the correct event
+
+- **Room-layout diagrams now attach to the right event.** Each embedded *Room Set Diagram* is paired to an event by its **position in the document** — the diagram is attached to the event whose row it chronologically follows (the one sharing that event name and booking number), including diagrams that overflow onto the next page.
+- Replaces the previous index-based pairing, which drifted out of sync whenever a room-set event carried no image, or an image had no explicit "Room Set Diagram" line — cascading every following diagram onto the wrong event.
+- Verified end-to-end against the full 246-page *Daily Resources by Space* report: all 49 embedded diagrams resolve to the correct room/event.
+
+---
+
 ## Tech stack
 
 | Layer | Technology |

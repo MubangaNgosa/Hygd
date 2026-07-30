@@ -492,7 +492,6 @@ _BS_ONSITE_RE  = re.compile(r'^(.*?)Onsite:\s*(.*)$')
 _BS_ITEM_RE    = re.compile(
     r'^(\d+(?:\.\d+)?)\s+\(?[\d,]+\.\d{2}\)?\s*(/?(?:EA|HR|PRS))\b\s*(.*)$'
 )
-_BS_DIAGRAM_MARK = 'Room Set Diagram'
 
 
 def _is_by_space_format(text: str) -> bool:
@@ -573,8 +572,13 @@ def _parse_bs_event_header(words: list[dict]) -> dict | None:
         'layout_image':   '',
         'cancelled':      bool(_CANCEL_RE.search(function)),
         'booking':        booking,
-        '_has_diagram':   False,
     }
+
+
+def _doc_pos(page_number: int, top: float) -> int:
+    """A single monotonically-increasing coordinate for an item's position in the
+    document (page first, then vertical offset), used to match diagrams to events."""
+    return page_number * 100_000 + int(top)
 
 
 def _extract_bs_layout(page, img: dict, event: dict, layout_dir: str) -> None:
@@ -601,17 +605,20 @@ def _parse_by_space_pdf(pdf_path: str) -> list[dict]:
     current_ev: dict | None = None
     layout_dir = os.path.join(os.path.dirname(os.path.abspath(pdf_path)), 'layouts')
 
-    # A Room Set Diagram's image sometimes flows onto the *next* page, so we
-    # collect diagram events and page images in document order and pair them
-    # sequentially (they are 1:1) once all pages have been read.
-    diagram_events: list[dict] = []
-    page_images: list = []
+    # Each embedded diagram belongs to exactly one event, but the two can't be
+    # paired by count/order alone: some room-set events carry no image while a
+    # diagram can overflow onto a later page. Instead we record the document
+    # position (page + vertical offset) of every event header and every image,
+    # then attach each image to the event whose header most recently began at or
+    # before it.
+    event_positions: list[tuple[int, dict]] = []       # (doc_pos, event)
+    page_images: list[tuple[int, object, dict]] = []   # (doc_pos, page, img)
 
     with pdfplumber.open(pdf_path) as pdf:
         for page in pdf.pages:
             if page.images:
                 largest = max(page.images, key=lambda im: im['width'] * im['height'])
-                page_images.append((page, largest))
+                page_images.append((_doc_pos(page.page_number, largest['top']), page, largest))
 
             for line in _cluster_words(page.extract_words()):
                 text = ' '.join(w['text'] for w in line).strip()
@@ -640,6 +647,9 @@ def _parse_by_space_pdf(pdf_path: str) -> list[dict]:
                     header['date'] = current_date
                     current_ev = header
                     events.append(current_ev)
+                    event_positions.append(
+                        (_doc_pos(page.page_number, min(w['top'] for w in line)), current_ev)
+                    )
                     continue
 
                 if current_ev is None:
@@ -670,9 +680,6 @@ def _parse_by_space_pdf(pdf_path: str) -> list[dict]:
                         'qty':  f"{qty} {unit}",
                         'item': name,
                     })
-                    if name.startswith(_BS_DIAGRAM_MARK) and current_ev not in diagram_events:
-                        current_ev['_has_diagram'] = True
-                        diagram_events.append(current_ev)
                     continue
 
                 # Continuation of the previous item (skip HDMI boilerplate)
@@ -682,13 +689,21 @@ def _parse_by_space_pdf(pdf_path: str) -> list[dict]:
                         last['item'] += '\n' + text
                     continue
 
-        # Pair each Room Set Diagram event with its image in document order
-        for ev, (page, img) in zip(diagram_events, page_images):
-            _extract_bs_layout(page, img, ev, layout_dir)
+        # Attach each embedded diagram to its owning event by document position:
+        # the event whose header most recently began at or before the image.
+        event_positions.sort(key=lambda ep: ep[0])
+        for img_pos, page, img in page_images:
+            owner = None
+            for ep_pos, ev in event_positions:
+                if ep_pos <= img_pos:
+                    owner = ev
+                else:
+                    break
+            if owner is not None:
+                _extract_bs_layout(page, img, owner, layout_dir)
 
     for ev in events:
         ev.pop('booking', None)
-        ev.pop('_has_diagram', None)
     return events
 
 
