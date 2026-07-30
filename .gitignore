@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# App runtime data — never version these
+events.db
+uploads/
+
+# Environment
+.env
+
+# IDE
+.idea/
+
+# Claude Code local settings
+.claude/settings.local.json
