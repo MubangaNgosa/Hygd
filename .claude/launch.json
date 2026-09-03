@@ -3,7 +3,7 @@
   "configurations": [
     {
       "name": "hygd",
-      "runtimeExecutable": "C:\\Users\\muban\\PycharmProjects\\amanda\\.venv\\Scripts\\python.exe",
+      "runtimeExecutable": "python",
       "runtimeArgs": ["app.py"],
       "port": 5000
     }

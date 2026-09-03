@@ -160,6 +160,7 @@ def _parse_lines(lines: list[str]) -> list[dict]:
                 'service_type':   service,
                 'attendance':     attendance,
                 'event_name':     '',
+                'event_number':   '',
                 'onsite_contact': '',
                 'mecs_contact':   '',
                 'setup_items':    [],
@@ -177,6 +178,7 @@ def _parse_lines(lines: list[str]) -> list[dict]:
             if om:
                 firstname, eid, rest = om.group(1), om.group(2), om.group(3).strip()
                 parts = rest.rsplit(None, 1)
+                current_ev['event_number']   = eid
                 current_ev['onsite_contact'] = f"{firstname} #{eid}"
                 current_ev['event_name']     = parts[0].strip() if len(parts) > 1 else rest
                 current_ev['mecs_contact']   = parts[1] if len(parts) > 1 else ''
@@ -187,6 +189,7 @@ def _parse_lines(lines: list[str]) -> list[dict]:
             if nm:
                 eid, rest = nm.group(1), nm.group(2).strip()
                 parts = rest.rsplit(None, 1)
+                current_ev['event_number']   = eid
                 current_ev['onsite_contact'] = f"#{eid}"
                 current_ev['event_name']     = parts[0].strip() if len(parts) > 1 else rest
                 current_ev['mecs_contact']   = parts[1] if len(parts) > 1 else ''
@@ -369,10 +372,11 @@ def _parse_function_date_page(text: str, prev_meta: dict | None) -> list[dict]:
     lines = text.splitlines()
 
     # Carry-forward defaults in case a page omits the Event:/Status: header
-    event_name = prev_meta['event_name']     if prev_meta else ''
-    status     = prev_meta['status']         if prev_meta else ''
-    onsite     = prev_meta['onsite']         if prev_meta else ''
-    mecs       = prev_meta['mecs']           if prev_meta else ''
+    event_name   = prev_meta['event_name']   if prev_meta else ''
+    event_number = prev_meta['event_number'] if prev_meta else ''
+    status       = prev_meta['status']       if prev_meta else ''
+    onsite       = prev_meta['onsite']       if prev_meta else ''
+    mecs         = prev_meta['mecs']         if prev_meta else ''
 
     fn_row_idx       = None
     order_header_idx = None
@@ -382,7 +386,8 @@ def _parse_function_date_page(text: str, prev_meta: dict | None) -> list[dict]:
 
         em = _FD_EVENT_RE.match(line)
         if em:
-            event_name = em.group(2).strip()
+            event_number = em.group(1).strip()
+            event_name   = em.group(2).strip()
             continue
 
         if line.startswith('Status:'):
@@ -443,6 +448,7 @@ def _parse_function_date_page(text: str, prev_meta: dict | None) -> list[dict]:
         'service_type':   service,
         'attendance':     attendance,
         'event_name':     event_name,
+        'event_number':   event_number,
         'onsite_contact': onsite,
         'mecs_contact':   mecs,
         'setup_items':    setup_items,
@@ -450,10 +456,11 @@ def _parse_function_date_page(text: str, prev_meta: dict | None) -> list[dict]:
         'cancelled':      bool(_CANCEL_RE.search(event_name) or _CANCEL_RE.search(status)),
     }
     ev['_meta'] = {
-        'event_name': event_name,
-        'status':     status,
-        'onsite':     onsite,
-        'mecs':       mecs,
+        'event_name':   event_name,
+        'event_number': event_number,
+        'status':       status,
+        'onsite':       onsite,
+        'mecs':         mecs,
     }
     return [ev]
 
@@ -564,12 +571,14 @@ def _parse_bs_event_header(words: list[dict]) -> dict | None:
         'service_type':   service_type,
         'attendance':     attend,
         'event_name':     event_name,
+        'event_number':   booking,
         'onsite_contact': '',
         'mecs_contact':   ' '.join(contact_words).strip(),
         'department':     '',
         'setup_items':    [],
         'notes':          '',
         'layout_image':   '',
+        'layout_images':  [],
         'cancelled':      bool(_CANCEL_RE.search(function)),
         'booking':        booking,
     }
@@ -582,7 +591,12 @@ def _doc_pos(page_number: int, top: float) -> int:
 
 
 def _extract_bs_layout(page, img: dict, event: dict, layout_dir: str) -> None:
-    """Render an embedded Room Set Diagram to a clean PNG and attach it."""
+    """Render an embedded Room Set Diagram to a clean PNG and attach it.
+
+    A single function can carry several diagrams (one per continuation page), so
+    images are appended to ``layout_images``; ``layout_image`` keeps the first for
+    backward compatibility with older data and single-image UI checks.
+    """
     bbox = (
         max(img['x0'], 0), max(img['top'], 0),
         min(img['x1'], page.width), min(img['bottom'], page.height),
@@ -593,7 +607,11 @@ def _extract_bs_layout(page, img: dict, event: dict, layout_dir: str) -> None:
         room_slug = re.sub(r'[^A-Za-z0-9]+', '', event['room']) or 'room'
         fname = f"layout_{event['booking']}_{room_slug}_p{page.page_number}.png"
         pil.save(os.path.join(layout_dir, fname))
-        event['layout_image'] = fname
+        imgs = event.setdefault('layout_images', [])
+        if fname not in imgs:
+            imgs.append(fname)
+        if not event.get('layout_image'):
+            event['layout_image'] = fname
     except Exception as exc:  # rendering is best-effort — never fail the upload
         print(f"[parser] layout render failed on page {page.page_number}: {exc}")
 
@@ -734,9 +752,16 @@ def _dedupe_events(events: list[dict]) -> list[dict]:
         m = merged[key]
         if len(e.get('setup_items', [])) > len(m.get('setup_items', [])):
             m['setup_items'] = e['setup_items']
-        if not m.get('layout_image') and e.get('layout_image'):
-            m['layout_image'] = e['layout_image']
-        for f in ('event_name', 'onsite_contact', 'mecs_contact',
+        # A function that spans several continuation pages is emitted as one
+        # duplicate per page, each carrying its own diagram — union them so every
+        # page's Room Set Diagram is kept, not just the first.
+        m_imgs = m.setdefault('layout_images', [])
+        for img in e.get('layout_images', []) or []:
+            if img not in m_imgs:
+                m_imgs.append(img)
+        if not m.get('layout_image') and m_imgs:
+            m['layout_image'] = m_imgs[0]
+        for f in ('event_name', 'event_number', 'onsite_contact', 'mecs_contact',
                   'attendance', 'notes', 'department'):
             if not m.get(f) and e.get(f):
                 m[f] = e[f]
@@ -771,6 +796,7 @@ def extract_and_parse_pdf(pdf_path: str, pdf_source: str = '') -> list[dict]:
     for ev in events:
         ev['pdf_source'] = label
         ev.setdefault('layout_image', '')
+        ev.setdefault('layout_images', [])
         ev.setdefault('department', '')
 
     print(f"[parser] Parsed {len(events)} events from {len(pages)} pages [{fmt}].")

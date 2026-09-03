@@ -151,7 +151,8 @@ let _eventsById = {};
 let groupedMode = false;
 let showHidden  = false;   // reveal events that users have hidden
 let showPast    = false;   // reveal events whose group's last instance has passed
-const FILTERS = { depts: new Set(), room: '', cancelledOnly: false };
+const FILTERS = { depts: new Set(), q: '', cancelledOnly: false };
+let _searchTimer = null;   // debounce handle for the search box
 
 // ── FullCalendar ──────────────────────────────────────────────────────────
 let calendar;
@@ -167,6 +168,15 @@ document.addEventListener('DOMContentLoaded', () => {
       listDay:  'Day',
       listWeek: 'Week',
       dayGridMonth: 'Month',
+    },
+    // "Jump to a date" button sitting next to the title — opens the native
+    // date picker and navigates the calendar there (mirrors the grouped view).
+    customButtons: {
+      datePicker: {
+        text: '📅',
+        hint: 'Jump to a date',
+        click: () => openDatePicker(document.querySelector('.fc-datePicker-button')),
+      },
     },
     noEventsContent: 'No events match the current filters',
     events: fetchEvents,
@@ -259,8 +269,8 @@ function isMobile() {
 
 function toolbarFor(mobile) {
   return mobile
-    ? { left: 'prev,next today', center: 'title', right: 'listDay,dayGridMonth' }
-    : { left: 'prev,next today', center: 'title', right: 'listDay,listWeek,dayGridMonth' };
+    ? { left: 'prev,next today', center: 'title datePicker', right: 'listDay,dayGridMonth' }
+    : { left: 'prev,next today', center: 'title datePicker', right: 'listDay,listWeek,dayGridMonth' };
 }
 
 function applyResponsiveToolbar() {
@@ -333,7 +343,11 @@ function applyFilters(list) {
     if (!showPast && p.group_past) return false;
     if (FILTERS.cancelledOnly && p.status !== 'cancelled') return false;
     if (FILTERS.depts.size && !FILTERS.depts.has(p.dept_category)) return false;
-    if (FILTERS.room && p.room !== FILTERS.room) return false;
+    if (FILTERS.q) {
+      // Free-text search across event number, room/location, and event name
+      const hay = `${p.event_number || ''} ${p.room || ''} ${e.title || ''}`.toLowerCase();
+      if (!hay.includes(FILTERS.q)) return false;
+    }
     return true;
   });
 }
@@ -341,11 +355,9 @@ function applyFilters(list) {
 function buildFilterBar(list) {
   // Department chips (with counts), sorted by frequency
   const counts = {};
-  const rooms  = new Set();
   for (const e of list) {
     const cat = e.extendedProps.dept_category || 'General';
     counts[cat] = (counts[cat] || 0) + 1;
-    if (e.extendedProps.room) rooms.add(e.extendedProps.room);
   }
 
   const chipWrap = document.getElementById('dept-filters');
@@ -371,20 +383,12 @@ function buildFilterBar(list) {
   chipWrap.innerHTML = (deptChips + cancelledChip)
     || '<span class="filter-empty">No events loaded</span>';
 
-  // Room dropdown — keep current selection if still present
-  const sel = document.getElementById('room-filter');
-  const sortedRooms = [...rooms].sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
-  const current = FILTERS.room;
-  sel.innerHTML = `<option value="">All rooms (${rooms.size})</option>` +
-    sortedRooms.map(r => `<option value="${escHtml(r)}"${r === current ? ' selected' : ''}>${escHtml(r)}</option>`).join('');
-  if (current && !rooms.has(current)) { FILTERS.room = ''; sel.value = ''; }
-
   updateFilterMeta(list.length);
 }
 
 function updateFilterMeta(total) {
   const shown  = applyFilters(ALL_EVENTS).length;
-  const active = FILTERS.depts.size > 0 || !!FILTERS.room || FILTERS.cancelledOnly;
+  const active = FILTERS.depts.size > 0 || !!FILTERS.q || FILTERS.cancelledOnly;
   const meta   = document.getElementById('filter-count');
   const clear  = document.getElementById('clear-filters');
   meta.textContent = active ? `Showing ${shown} of ${total}` : `${total} event${total !== 1 ? 's' : ''}`;
@@ -416,6 +420,24 @@ function decorateEvent(info, isList) {
   const titleEl = info.el.querySelector('.fc-list-event-title')
                || info.el.querySelector('.fc-event-title');
   if (!titleEl) return;
+
+  // Event number — leading badge, mirrors how it reads on the source PDF (#191346 …)
+  if (p.event_number && !titleEl.querySelector('.ev-number')) {
+    const s = document.createElement('span');
+    s.className = 'ev-number';
+    s.textContent = `#${p.event_number}`;
+    s.title = 'Event number';
+    titleEl.prepend(s);
+  }
+  // Room / location — chip after the title, so it's visible without opening the event
+  if (isList && p.room && !titleEl.querySelector('.ev-room')) {
+    const s = document.createElement('span');
+    s.className = 'ev-room';
+    s.innerHTML = '<i class="bi bi-geo-alt-fill"></i> ';
+    s.appendChild(document.createTextNode(p.room));
+    s.title = 'Room / location';
+    titleEl.appendChild(s);
+  }
 
   if (p.layout_image && !titleEl.querySelector('.ev-flag')) {
     const s = document.createElement('span');
@@ -497,8 +519,28 @@ function updateGroupedToolbar() {
   });
 }
 
+// Keep only events whose start falls within the calendar's *principal* period
+// (the actual day/week/month), not the padded grid range used for fetching. A
+// month view loads spillover days from the adjacent months to fill the grid;
+// grouped mode should ignore those and show only what happens in the period.
+function withinCurrentPeriod(list) {
+  if (!calendar) return list;
+  const view    = calendar.view;
+  const startMs = view.currentStart.getTime();
+  const endMs   = view.currentEnd.getTime();   // exclusive
+  return list.filter(e => {
+    const s = parseLocalISO(e.start);
+    if (!s) return false;
+    const t = s.getTime();
+    return t >= startMs && t < endMs;
+  });
+}
+
 function renderGrouped(list) {
   const panel = document.getElementById('grouped-panel');
+
+  // Restrict to events that actually start within the selected period.
+  list = withinCurrentPeriod(list);
 
   // Bucket events by their colour-group key (client / event name)
   const groups = {};
@@ -591,8 +633,21 @@ function renderGrouped(list) {
   }).join('');
 }
 
+// Parse an ISO value from the API as LOCAL time. A bare "YYYY-MM-DD" (an event
+// with no time) would otherwise be read as UTC midnight by `new Date`, drifting
+// a day in the viewer's timezone — the calendar view avoids this because
+// FullCalendar parses dates timezone-safely. Appending a midnight time forces
+// local parsing so grouped view matches.
+function parseLocalISO(iso) {
+  if (!iso) return null;
+  return new Date(iso.length === 10 ? iso + 'T00:00:00' : iso);
+}
+
 function fmtTimeISO(iso) {
-  return iso ? fmtTime(new Date(iso)) : '';
+  // A date-only value has no clock time — show nothing rather than a bogus
+  // timezone-shifted time (e.g. "17:00" for an all-day event).
+  if (!iso || iso.length === 10) return '';
+  return fmtTime(new Date(iso));
 }
 
 // Open the detail modal from a raw /api/events object (normalise start/end to Date)
@@ -600,8 +655,8 @@ function openEventRaw(raw) {
   showEventModal({
     id:    raw.id,
     title: raw.title,
-    start: raw.start ? new Date(raw.start) : null,
-    end:   raw.end ? new Date(raw.end) : null,
+    start: parseLocalISO(raw.start),
+    end:   parseLocalISO(raw.end),
     extendedProps: raw.extendedProps,
   });
 }
@@ -619,7 +674,8 @@ function showEventModal(event) {
     ? 'linear-gradient(135deg, #555, #777)'
     : 'linear-gradient(135deg, #4f46e5, #7c3aed)';
 
-  document.getElementById('eventModalLabel').textContent = event.title;
+  document.getElementById('eventModalLabel').textContent =
+    props.event_number ? `#${props.event_number}  ${event.title}` : event.title;
   document.getElementById('event-modal-sub').textContent =
     props.room ? `Room: ${props.room}  ·  ${props.service_type || ''}` : props.service_type || '';
 
@@ -672,15 +728,23 @@ function showEventModal(event) {
       </div>
     </div>`;
 
-  // Room layout diagram (auto-extracted screenshot)
-  const layoutHtml = props.layout_image
+  // Room layout diagrams (auto-extracted screenshots). A single function can
+  // carry several diagrams across continuation pages, so render them as a gallery.
+  const layoutImgs = (props.layout_images && props.layout_images.length)
+    ? props.layout_images
+    : (props.layout_image ? [props.layout_image] : []);
+  const layoutHtml = layoutImgs.length
     ? `<div class="layout-section mb-3">
-         <h6>Room Layout</h6>
-         <a href="/layouts/${encodeURIComponent(props.layout_image)}" target="_blank" rel="noopener"
-            title="Click to open the full-size layout">
-           <img class="layout-img" src="/layouts/${encodeURIComponent(props.layout_image)}"
-                alt="Room layout diagram for ${escHtml(props.room || '')}" loading="lazy">
-         </a>
+         <h6>Room Layout${layoutImgs.length > 1
+              ? ` <span class="layout-count">${layoutImgs.length}</span>` : ''}</h6>
+         <div class="layout-gallery">
+           ${layoutImgs.map((fn, i) => `
+             <a href="/layouts/${encodeURIComponent(fn)}" target="_blank" rel="noopener"
+                title="Click to open full-size layout ${i + 1} of ${layoutImgs.length}">
+               <img class="layout-img" src="/layouts/${encodeURIComponent(fn)}"
+                    alt="Room layout diagram ${i + 1} for ${escHtml(props.room || '')}" loading="lazy">
+             </a>`).join('')}
+         </div>
        </div>`
     : '';
 
@@ -919,9 +983,14 @@ const App = {
     calendar.refetchEvents();
   },
 
-  setRoom(room) {
-    FILTERS.room = room || '';
-    calendar.refetchEvents();
+  setSearch(text) {
+    FILTERS.q = (text || '').trim().toLowerCase();
+    // Debounce so we don't re-render on every keystroke
+    clearTimeout(_searchTimer);
+    _searchTimer = setTimeout(() => {
+      if (groupedMode) renderGrouped(applyFilters(ALL_EVENTS));
+      else             calendar.refetchEvents();
+    }, 160);
   },
 
   toggleCancelled() {
@@ -931,8 +1000,10 @@ const App = {
 
   clearFilters() {
     FILTERS.depts.clear();
-    FILTERS.room = '';
+    FILTERS.q = '';
     FILTERS.cancelledOnly = false;
+    const search = document.getElementById('event-search');
+    if (search) search.value = '';
     calendar.refetchEvents();
   },
 
@@ -947,6 +1018,18 @@ const App = {
   groupedNext()  { calendar.next(); },
   groupedToday() { calendar.today(); },
   groupedRange(view) { calendar.changeView(view); },
+
+  // Open the native date picker (used by both the calendar and grouped views),
+  // anchored under whichever button triggered it.
+  pickDate(anchor) { openDatePicker(anchor); },
+
+  // Jump to the chosen date; gotoDate refetches, re-rendering whichever view
+  // (calendar or grouped) is active for the new period.
+  jumpToDate(dateStr) {
+    if (!dateStr || !calendar) return;
+    const [y, m, d] = dateStr.split('-').map(Number);
+    calendar.gotoDate(new Date(y, m - 1, d));   // local Date — no UTC drift
+  },
 
   toggleHidden() {
     showHidden = !showHidden;
@@ -1235,6 +1318,34 @@ function fmtDateRange(minIso, maxIso) {
 
 function fmtTime(dt) {
   return dt.toLocaleTimeString('en-CA', { hour: '2-digit', minute: '2-digit', hour12: false });
+}
+
+// A local Date → "YYYY-MM-DD" for a date input's value (no UTC conversion).
+function toDateInputValue(d) {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+
+// Open the shared hidden date input as a native picker, positioned just under
+// the button that triggered it, seeded to the period currently in view. On
+// pick, App.jumpToDate() navigates the calendar (see the input's onchange).
+function openDatePicker(anchor) {
+  const inp = document.getElementById('jump-datepicker');
+  if (!inp || !calendar) return;
+  if (anchor) {
+    const r = anchor.getBoundingClientRect();
+    inp.style.left = `${window.scrollX + r.left}px`;
+    inp.style.top  = `${window.scrollY + r.bottom}px`;
+  }
+  inp.value = toDateInputValue(calendar.view.currentStart);
+  try {
+    if (typeof inp.showPicker === 'function') inp.showPicker();
+    else inp.focus();
+  } catch (_) {
+    inp.focus();   // some browsers refuse showPicker() on a hidden anchor
+  }
 }
 
 function escHtml(str) {

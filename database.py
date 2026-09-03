@@ -21,6 +21,7 @@ def init_db():
             end_time TEXT DEFAULT '',
             room TEXT DEFAULT '',
             event_name TEXT DEFAULT '',
+            event_number TEXT DEFAULT '',
             service_type TEXT DEFAULT '',
             onsite_contact TEXT DEFAULT '',
             mecs_contact TEXT DEFAULT '',
@@ -29,6 +30,7 @@ def init_db():
             attendance TEXT DEFAULT '',
             department TEXT DEFAULT '',
             layout_image TEXT DEFAULT '',
+            layout_images TEXT DEFAULT '[]',
             checked_items TEXT DEFAULT '[]',
             assistant_note TEXT DEFAULT '',
             pdf_source TEXT DEFAULT '',
@@ -63,9 +65,11 @@ def _migrate(conn):
     """Add columns that may be missing from older database files."""
     cols = {row[1] for row in conn.execute("PRAGMA table_info(events)").fetchall()}
     migrations = [
+        ("event_number", "ALTER TABLE events ADD COLUMN event_number TEXT DEFAULT ''"),
         ("attendance",   "ALTER TABLE events ADD COLUMN attendance TEXT DEFAULT ''"),
         ("department",     "ALTER TABLE events ADD COLUMN department TEXT DEFAULT ''"),
         ("layout_image",   "ALTER TABLE events ADD COLUMN layout_image TEXT DEFAULT ''"),
+        ("layout_images",  "ALTER TABLE events ADD COLUMN layout_images TEXT DEFAULT '[]'"),
         ("checked_items",  "ALTER TABLE events ADD COLUMN checked_items TEXT DEFAULT '[]'"),
         ("assistant_note", "ALTER TABLE events ADD COLUMN assistant_note TEXT DEFAULT ''"),
         ("status",         "ALTER TABLE events ADD COLUMN status TEXT DEFAULT 'active'"),
@@ -102,10 +106,11 @@ def _migrate_assistant_notes(conn):
 
 # ── Content comparison ────────────────────────────────────────────────────────
 
-def _content_changed(existing: dict, new: dict, setup_json: str, new_status: str) -> bool:
+def _content_changed(existing: dict, new: dict, setup_json: str,
+                     layout_images_json: str, new_status: str) -> bool:
     """Return True if any meaningful field in the existing row differs from the incoming event."""
     text_fields = [
-        'event_name', 'service_type', 'onsite_contact',
+        'event_name', 'event_number', 'service_type', 'onsite_contact',
         'mecs_contact', 'notes', 'attendance', 'department', 'layout_image',
     ]
     for f in text_fields:
@@ -113,6 +118,9 @@ def _content_changed(existing: dict, new: dict, setup_json: str, new_status: str
             return True
     # Compare setup_items as JSON string
     if (existing.get('setup_items') or '[]') != setup_json:
+        return True
+    # Compare the full list of layout diagrams as JSON string
+    if (existing.get('layout_images') or '[]') != layout_images_json:
         return True
     # Status change (e.g. active → cancelled)
     if (existing.get('status') or 'active') != new_status:
@@ -154,6 +162,7 @@ def save_events(events: list[dict]) -> tuple[int, int, int, int]:
         is_cancelled = e.get('cancelled', False)
         status = 'cancelled' if is_cancelled else 'active'
         setup_json = json.dumps(e.get('setup_items', []))
+        layout_images_json = json.dumps(e.get('layout_images', []))
 
         # A single space can host several functions at the same time (e.g. a
         # Room Set, an Audio Visual and a Ceremony), so service_type is part of
@@ -172,13 +181,15 @@ def save_events(events: list[dict]) -> tuple[int, int, int, int]:
             # ── Brand new event ───────────────────────────────────────────────
             conn.execute(
                 '''INSERT INTO events
-                   (date, start_time, end_time, room, event_name, service_type,
-                    onsite_contact, mecs_contact, setup_items, notes,
-                    attendance, department, layout_image, pdf_source, status)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                   (date, start_time, end_time, room, event_name, event_number,
+                    service_type, onsite_contact, mecs_contact, setup_items, notes,
+                    attendance, department, layout_image, layout_images,
+                    pdf_source, status)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
                 (
                     date, start, end, room,
                     e.get('event_name', ''),
+                    e.get('event_number', ''),
                     e.get('service_type', ''),
                     e.get('onsite_contact', ''),
                     e.get('mecs_contact', ''),
@@ -187,6 +198,7 @@ def save_events(events: list[dict]) -> tuple[int, int, int, int]:
                     e.get('attendance', ''),
                     e.get('department', ''),
                     e.get('layout_image', ''),
+                    layout_images_json,
                     e.get('pdf_source', ''),
                     status,
                 )
@@ -197,17 +209,18 @@ def save_events(events: list[dict]) -> tuple[int, int, int, int]:
 
         else:
             existing_dict = dict(existing)
-            if _content_changed(existing_dict, e, setup_json, status):
+            if _content_changed(existing_dict, e, setup_json, layout_images_json, status):
                 # ── Existing event with changes → update ──────────────────────
                 conn.execute(
                     '''UPDATE events SET
-                       event_name=?, service_type=?, onsite_contact=?, mecs_contact=?,
-                       setup_items=?, notes=?, attendance=?, department=?,
-                       layout_image=?, pdf_source=?, status=?,
+                       event_name=?, event_number=?, service_type=?, onsite_contact=?,
+                       mecs_contact=?, setup_items=?, notes=?, attendance=?, department=?,
+                       layout_image=?, layout_images=?, pdf_source=?, status=?,
                        updated_at=CURRENT_TIMESTAMP
                        WHERE id=?''',
                     (
                         e.get('event_name', ''),
+                        e.get('event_number', ''),
                         e.get('service_type', ''),
                         e.get('onsite_contact', ''),
                         e.get('mecs_contact', ''),
@@ -216,6 +229,7 @@ def save_events(events: list[dict]) -> tuple[int, int, int, int]:
                         e.get('attendance', ''),
                         e.get('department', ''),
                         e.get('layout_image', ''),
+                        layout_images_json,
                         e.get('pdf_source', ''),
                         status,
                         existing_dict['id'],
@@ -254,6 +268,24 @@ def save_events(events: list[dict]) -> tuple[int, int, int, int]:
 
 # ── Queries ───────────────────────────────────────────────────────────────────
 
+def _decode_layout_images(e: dict) -> None:
+    """Parse the layout_images JSON list and reconcile it with the legacy
+    single `layout_image` column, so rows written before multi-diagram support
+    (which only have `layout_image`) still surface their diagram as a list."""
+    try:
+        imgs = json.loads(e.get('layout_images') or '[]')
+        if not isinstance(imgs, list):
+            imgs = []
+    except (json.JSONDecodeError, TypeError):
+        imgs = []
+    primary = (e.get('layout_image') or '').strip()
+    if not imgs and primary:
+        imgs = [primary]
+    if imgs and not primary:
+        e['layout_image'] = imgs[0]
+    e['layout_images'] = imgs
+
+
 def get_events(start: str = None, end: str = None) -> list[dict]:
     conn = get_connection()
     query = 'SELECT * FROM events'
@@ -284,6 +316,7 @@ def get_events(start: str = None, end: str = None) -> list[dict]:
             e['checked_items'] = json.loads(e.get('checked_items') or '[]')
         except (json.JSONDecodeError, TypeError):
             e['checked_items'] = []
+        _decode_layout_images(e)
         e['note_count'] = note_counts.get(e['id'], 0)
         result.append(e)
     return result
@@ -303,6 +336,7 @@ def get_event_by_id(event_id: int) -> dict | None:
             e['checked_items'] = json.loads(e.get('checked_items') or '[]')
         except (json.JSONDecodeError, TypeError):
             e['checked_items'] = []
+        _decode_layout_images(e)
         return e
     return None
 

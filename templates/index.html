@@ -47,6 +47,9 @@
             title="Show events whose last instance has already passed">
       <i class="bi bi-clock-history me-1"></i><span class="btn-label">Show past</span>
     </button>
+    <a class="btn btn-outline-light" href="/analytics" title="View event analytics">
+      <i class="bi bi-bar-chart-line me-1"></i><span class="btn-label">Analytics</span>
+    </a>
     <button class="btn btn-primary" onclick="App.openUpload()" title="Upload a PDF report">
       <i class="bi bi-cloud-upload me-1"></i><span class="btn-label">Upload PDF</span>
     </button>
@@ -63,11 +66,10 @@
     <div id="dept-filters" class="dept-chips"></div>
   </div>
   <div class="filter-group">
-    <span class="filter-label"><i class="bi bi-geo-alt me-1"></i>Room</span>
-    <select id="room-filter" class="form-select form-select-sm room-select"
-            onchange="App.setRoom(this.value)">
-      <option value="">All rooms</option>
-    </select>
+    <span class="filter-label"><i class="bi bi-search me-1"></i>Search</span>
+    <input id="event-search" type="search" class="form-control form-control-sm search-input"
+           placeholder="Room, event # or name…" autocomplete="off" spellcheck="false"
+           oninput="App.setSearch(this.value)">
   </div>
   <button id="clear-filters" class="btn btn-sm clear-filters d-none"
           onclick="App.clearFilters()">
@@ -93,7 +95,13 @@
       <button class="gt-btn" onclick="App.groupedNext()" title="Next"><i class="bi bi-chevron-right"></i></button>
       <button class="gt-btn gt-today" onclick="App.groupedToday()">Today</button>
     </div>
-    <div id="grouped-title" class="gt-title"></div>
+    <div class="gt-titlebar">
+      <div id="grouped-title" class="gt-title"></div>
+      <button class="gt-btn gt-cal" onclick="App.pickDate(this)"
+              title="Jump to a date" aria-label="Jump to a date">
+        <i class="bi bi-calendar3"></i>
+      </button>
+    </div>
     <div class="gt-views">
       <button class="gt-btn" data-range="listDay"     onclick="App.groupedRange('listDay')">Day</button>
       <button class="gt-btn" data-range="listWeek"    onclick="App.groupedRange('listWeek')">Week</button>
@@ -225,6 +233,10 @@
     </div>
   </div>
 </div>
+
+<!-- Shared "jump to a date" picker (positioned under whichever button opens it) -->
+<input type="date" id="jump-datepicker" class="jump-datepicker"
+       onchange="App.jumpToDate(this.value)" aria-hidden="true" tabindex="-1">
 
 <!-- Bootstrap JS -->
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>

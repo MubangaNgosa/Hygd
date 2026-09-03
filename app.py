@@ -14,6 +14,8 @@ from flask import Flask, jsonify, render_template, request, send_from_directory
 
 load_dotenv()
 
+from analytics import build_analytics
+from analytics import dept_category as _dept_category
 from database import (add_note, count_events_in_range, delete_all_events,
                       delete_event, delete_events_in_range, delete_note,
                       get_event_by_id, get_events, get_notes, get_stats,
@@ -34,6 +36,11 @@ init_db()
 @app.route("/")
 def index():
     return render_template("index.html")
+
+
+@app.route("/analytics")
+def analytics_page():
+    return render_template("analytics.html")
 
 
 @app.route("/layouts/<path:filename>")
@@ -117,6 +124,7 @@ def api_events():
             "start": start_iso,
             "end": end_iso or None,
             "extendedProps": {
+                "event_number":   e.get("event_number", ""),
                 "room":           e.get("room", ""),
                 "service_type":   e.get("service_type", ""),
                 "onsite_contact": e.get("onsite_contact", ""),
@@ -128,6 +136,7 @@ def api_events():
                 "department":     e.get("department", ""),
                 "dept_category":  _dept_category(e.get("department", ""), e.get("service_type", "")),
                 "layout_image":   e.get("layout_image", ""),
+                "layout_images":  e.get("layout_images", []),
                 "checked_items":  e.get("checked_items", []),
                 "assistant_note": e.get("assistant_note", ""),
                 "group_key":      group_key,
@@ -287,28 +296,14 @@ def api_stats():
     return jsonify(get_stats())
 
 
+@app.route("/api/analytics")
+def api_analytics():
+    """Aggregated event analytics, bucketed into an 'All' view and per SFU
+    semester (Fall/Spring/Summer). See analytics.build_analytics."""
+    return jsonify(build_analytics(get_events()))
+
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
-
-def _dept_category(department: str, service_type: str) -> str:
-    """Bucket a raw department/service label into a small filterable set."""
-    d = (department or "").lower()
-    s = (service_type or "").lower()
-    if "facilit" in d:
-        return "Facilities"
-    if "audio" in d or "a/v" in d or "sfu live" in d or "av" == s.strip():
-        return "AV / Production"
-    if "security" in d:
-        return "Security"
-    if "food" in d or "beverage" in d or "cater" in d:
-        return "Catering"
-    if "parking" in d:
-        return "Parking"
-    if "event services" in d or "event service" in d:
-        return "Event Services"
-    if department:
-        return department  # keep any other named provider as its own bucket
-    return "General"
-
 
 def _group_key(e: dict) -> str:
     """
