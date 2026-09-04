@@ -490,6 +490,11 @@ _BS_TIME_MAX_X    = 200    # Start/End (time range) sits between ROOM_MAX and he
 _BS_CONTACT_MIN_X = 531    # Contact column begins at ~537
 
 _BS_HEADER_RE  = re.compile(r'^Space\s+Start\s+End\s+Function')
+# Report date-range subtitle at the top of every page, e.g.
+#   "September 3, 2026 - September 13, 2026"
+_BS_RANGE_RE   = re.compile(
+    r'^[A-Z][a-z]+\s+\d{1,2},\s+\d{4}\s*-\s*[A-Z][a-z]+\s+\d{1,2},\s+\d{4}$'
+)
 _BS_BOOKING_RE = re.compile(r'^#(\d+)$')
 _BS_TIME_RE    = re.compile(r'(\d{1,2}:\d{2})\D+(\d{1,2}:\d{2})')
 _BS_ATT_RE     = re.compile(r'^\(?(\d+)\s*PPL\)?$', re.IGNORECASE)
@@ -654,6 +659,7 @@ def _parse_by_space_pdf(pdf_path: str) -> list[dict]:
                 # Page chrome
                 if (_BS_HEADER_RE.match(text)
                         or text.startswith('Daily Resources')
+                        or _BS_RANGE_RE.match(text)
                         or text in ('Burnaby', 'All Departments', 'MECS')
                         or _FD_FOOTER_RE.match(text)
                         or _FD_PAGE_RE.search(text)):
