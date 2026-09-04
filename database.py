@@ -139,7 +139,8 @@ def save_events(events: list[dict]) -> tuple[int, int, int, int]:
     - new:       event did not exist → inserted
     - updated:   event existed but content/status changed → updated in place
     - cancelled: events explicitly cancelled in the PDF + previously-active events
-                 that no longer appear in the PDF for a covered date (omission cancellation)
+                 that no longer appear in the PDF, but ONLY within the date range
+                 the PDF spans (omission cancellation — see below)
     - skipped:   event existed and is byte-for-byte identical → no DB write
     """
     conn = get_connection()
@@ -150,7 +151,8 @@ def save_events(events: list[dict]) -> tuple[int, int, int, int]:
 
     # Track which (date, start_time, end_time, room) tuples appear in the new PDF
     seen_keys: set[tuple] = set()
-    # Track which dates are covered by the new PDF
+    # Track every date the new PDF carries an event on, so we can derive the
+    # date window it covers for omission cancellation.
     covered_dates: set[str] = set()
 
     for e in events:
@@ -242,13 +244,20 @@ def save_events(events: list[dict]) -> tuple[int, int, int, int]:
                 # ── Identical — nothing to do ─────────────────────────────────
                 skipped_count += 1
 
-    # ── Omission cancellation ─────────────────────────────────────────────────
-    # For every date the PDF covers, mark active events that are no longer listed
-    # as cancelled (they were removed from the PDF, implying cancellation).
-    for date in covered_dates:
+    # ── Omission cancellation (scoped to the uploaded PDF's date range) ────────
+    # An event that was on the schedule but is absent from the new PDF is treated
+    # as cancelled — but ONLY within the date window this PDF actually spans
+    # (min…max of the dates it lists). A report covering Sept 2–5 must never
+    # touch events on Sept 1 or Sept 6+, which were simply out of its scope.
+    # Reconciling only inside [range_start, range_end] keeps a short/partial-range
+    # upload from wiping events outside its window. If the PDF parsed to zero
+    # events, covered_dates is empty and we cancel nothing (guards a bad parse).
+    if covered_dates:
+        range_start, range_end = min(covered_dates), max(covered_dates)
         db_events = conn.execute(
-            "SELECT * FROM events WHERE date=? AND status != 'cancelled'",
-            (date,),
+            "SELECT * FROM events WHERE date >= ? AND date <= ? "
+            "AND status != 'cancelled'",
+            (range_start, range_end),
         ).fetchall()
         for row in db_events:
             key = (row['date'], row['start_time'], row['end_time'],
