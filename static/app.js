@@ -1043,11 +1043,17 @@ async function doUpload(file) {
   try {
     const res  = await fetch('/upload', { method: 'POST', body: formData });
 
-    // A server/proxy error (413, 502, 504…) returns an HTML page, not JSON, so
-    // check the status before parsing — otherwise res.json() throws a cryptic
-    // "unexpected character" error that hides the real cause.
+    // A server/proxy error (413, 502, 504…) often returns an HTML page, not
+    // JSON, so check the status before parsing — otherwise res.json() throws a
+    // cryptic "unexpected character" error that hides the real cause. When the
+    // app itself returns a JSON error (e.g. a 500 "Parsing failed: …"), surface
+    // that specific message rather than a generic one.
     if (!res.ok) {
-      const msg = res.status === 413
+      let serverMsg = '';
+      try { serverMsg = (JSON.parse(await res.text()) || {}).error || ''; } catch (_) {}
+      const msg = serverMsg
+        ? serverMsg
+        : res.status === 413
         ? 'This file is too large for the server to accept. Ask an admin to raise the upload size limit (nginx client_max_body_size).'
         : (res.status === 502 || res.status === 504)
         ? 'The server timed out processing this report — it may be very large. Ask an admin to raise the request timeout (gunicorn --timeout / nginx proxy_read_timeout).'
