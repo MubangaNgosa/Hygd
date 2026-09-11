@@ -287,6 +287,36 @@ body {
   color: #9aa0a6;
 }
 
+/* Explicit "mark complete" toggle */
+.complete-section { margin-top: -.25rem; }
+.complete-toggle {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  width: 100%;
+  margin: 0;
+  padding: 10px 12px;
+  font-size: .85rem;
+  font-weight: 600;
+  color: #4f46e5;
+  background: #eef2ff;
+  border: 1px solid #e0e4ff;
+  border-radius: 10px;
+  cursor: pointer;
+  user-select: none;
+}
+.complete-toggle input { position: absolute; opacity: 0; pointer-events: none; }
+.complete-toggle.on {
+  color: #1b7a41;
+  background: #d5f0de;
+  border-color: #b7e5c6;
+}
+.complete-hint {
+  margin: 6px 2px 0;
+  font-size: .75rem;
+  color: #6c757d;
+}
+
 /* Notes thread (append-only, attributed) */
 .notes-thread-section h6 {
   display: flex;
@@ -342,6 +372,47 @@ body {
 .note-text { font-size: .9rem; color: #212529; white-space: normal; word-break: break-word; }
 .note-edit-input { font-size: .9rem; resize: vertical; }
 .notes-add textarea { font-size: .9rem; resize: vertical; }
+.notes-add-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+
+/* Photos on a posted note */
+.note-images { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+.note-image-thumb {
+  width: 92px;
+  height: 92px;
+  object-fit: cover;
+  border-radius: 8px;
+  border: 1px solid #dee2e6;
+  cursor: pointer;
+  transition: transform .1s ease;
+}
+.note-image-thumb:hover { transform: scale(1.03); }
+
+/* Staged (pre-post) photo previews with a remove button */
+.note-image-preview { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+.note-image-preview:empty { margin-top: 0; }
+.note-image-chip { position: relative; display: inline-flex; }
+.note-image-chip img {
+  width: 64px;
+  height: 64px;
+  object-fit: cover;
+  border-radius: 8px;
+  border: 1px solid #dee2e6;
+}
+.note-image-remove {
+  position: absolute;
+  top: -6px;
+  right: -6px;
+  width: 20px;
+  height: 20px;
+  line-height: 18px;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: #dc3545;
+  color: #fff;
+  font-size: 14px;
+  cursor: pointer;
+}
 
 /* Header identity ("Signed in as …") */
 .header-identity {
@@ -1261,6 +1332,9 @@ body {
   .setup-list.checklist li.completed .setup-item-name { color: #6c7280; }
   .setup-list li:hover { background: #1e1b4b; }
   .setup-item-name { color: #d0d4e8; }
+  .complete-toggle { color: #a5b4fc; background: #1e1b4b; border-color: #3730a3; }
+  .complete-toggle.on { color: #6fe093; background: #14401f; border-color: #1f5a30; }
+  .complete-hint { color: #8b91a8; }
 
   /* Notes thread */
   .notes-sync { color: #8b91a8; }
@@ -1272,6 +1346,7 @@ body {
   .note-text { color: #d0d4e8; }
   .note-action { color: #8b91a8; }
   .note-action:hover { background: rgba(255,255,255,.08); color: #a5b4fc; }
+  .note-image-thumb, .note-image-chip img { border-color: #3a3f55; }
 
   .notes-block {
     background: #23200f;

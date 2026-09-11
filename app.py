@@ -7,6 +7,7 @@ Production:      gunicorn -w 2 -b 0.0.0.0:5000 app:app
 
 import os
 import re
+import uuid
 from datetime import datetime
 
 from dotenv import load_dotenv
@@ -28,6 +29,13 @@ app.config["UPLOAD_FOLDER"] = "uploads"
 app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024  # 50 MB
 
 os.makedirs(app.config["UPLOAD_FOLDER"], exist_ok=True)
+
+# Photos attached to notes live here and are served from /note-images/<file>.
+NOTE_IMAGE_DIR = os.path.join(app.config["UPLOAD_FOLDER"], "note_images")
+os.makedirs(NOTE_IMAGE_DIR, exist_ok=True)
+_ALLOWED_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".heic", ".heif"}
+_MAX_NOTE_IMAGES = 10
+
 init_db()
 
 
@@ -48,6 +56,12 @@ def layout_image(filename):
     """Serve an extracted room-layout diagram image."""
     layout_dir = os.path.join(app.config["UPLOAD_FOLDER"], "layouts")
     return send_from_directory(layout_dir, filename)
+
+
+@app.route("/note-images/<path:filename>")
+def note_image(filename):
+    """Serve a photo attached to a note."""
+    return send_from_directory(NOTE_IMAGE_DIR, filename)
 
 
 # ── Upload ───────────────────────────────────────────────────────────────────
@@ -138,6 +152,7 @@ def api_events():
                 "layout_image":   e.get("layout_image", ""),
                 "layout_images":  e.get("layout_images", []),
                 "checked_items":  e.get("checked_items", []),
+                "manually_complete": bool(e.get("manually_complete", 0)),
                 "assistant_note": e.get("assistant_note", ""),
                 "group_key":      group_key,
                 "status":         e.get("status", "active"),
@@ -181,10 +196,14 @@ def api_event_progress(event_id):
     if note is not None:
         note = str(note)[:5000]
 
-    if checked is None and note is None:
+    manual = data.get("manually_complete")
+    if manual is not None:
+        manual = bool(manual)
+
+    if checked is None and note is None and manual is None:
         return jsonify({"error": "nothing to update"}), 400
 
-    if not set_event_progress(event_id, checked, note):
+    if not set_event_progress(event_id, checked, note, manual):
         return jsonify({"error": "event not found"}), 404
     return jsonify({"success": True})
 
@@ -199,6 +218,35 @@ def _author(data: dict) -> str:
     return str(data.get("author", "")).strip()[:_MAX_AUTHOR]
 
 
+def _save_note_images(files) -> list[str]:
+    """Save uploaded note photos to NOTE_IMAGE_DIR and return their stored
+    filenames. Non-image files are skipped; capped at _MAX_NOTE_IMAGES."""
+    saved: list[str] = []
+    for f in files:
+        if not f or not f.filename:
+            continue
+        ext = os.path.splitext(f.filename)[1].lower()
+        if ext not in _ALLOWED_IMAGE_EXTS:
+            continue
+        name = f"{uuid.uuid4().hex}{ext}"
+        f.save(os.path.join(NOTE_IMAGE_DIR, name))
+        saved.append(name)
+        if len(saved) >= _MAX_NOTE_IMAGES:
+            break
+    return saved
+
+
+def _delete_note_images(images) -> None:
+    """Remove image files backing a deleted note; ignore anything already gone."""
+    for name in images or []:
+        # Guard against path traversal — only ever touch the note-image dir.
+        safe = os.path.basename(str(name))
+        try:
+            os.remove(os.path.join(NOTE_IMAGE_DIR, safe))
+        except OSError:
+            pass
+
+
 @app.route("/api/events/<int:event_id>/notes")
 def api_get_notes(event_id):
     return jsonify(get_notes(event_id))
@@ -208,14 +256,23 @@ def api_get_notes(event_id):
 def api_add_note(event_id):
     if not get_event_by_id(event_id):
         return jsonify({"error": "event not found"}), 404
-    data   = request.get_json(silent=True) or {}
-    author = _author(data)
-    text   = str(data.get("text", "")).strip()[:_MAX_NOTE]
+
+    # Photos arrive as multipart/form-data; a plain text note still comes as JSON.
+    if request.files:
+        author = str(request.form.get("author", "")).strip()[:_MAX_AUTHOR]
+        text   = str(request.form.get("text", "")).strip()[:_MAX_NOTE]
+        images = _save_note_images(request.files.getlist("images"))
+    else:
+        data   = request.get_json(silent=True) or {}
+        author = _author(data)
+        text   = str(data.get("text", "")).strip()[:_MAX_NOTE]
+        images = []
+
     if not author:
         return jsonify({"error": "author required"}), 400
-    if not text:
-        return jsonify({"error": "text required"}), 400
-    return jsonify(add_note(event_id, author, text)), 201
+    if not text and not images:
+        return jsonify({"error": "text or image required"}), 400
+    return jsonify(add_note(event_id, author, text, images)), 201
 
 
 @app.route("/api/notes/<int:note_id>", methods=["PATCH"])
@@ -237,8 +294,10 @@ def api_delete_note(note_id):
     author = _author(data)
     if not author:
         return jsonify({"error": "author required"}), 400
-    if not delete_note(note_id, author):
+    images = delete_note(note_id, author)
+    if images is None:
         return jsonify({"error": "note not found or not yours to delete"}), 403
+    _delete_note_images(images)
     return jsonify({"success": True})
 
 

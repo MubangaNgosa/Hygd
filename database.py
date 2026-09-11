@@ -32,6 +32,7 @@ def init_db():
             layout_image TEXT DEFAULT '',
             layout_images TEXT DEFAULT '[]',
             checked_items TEXT DEFAULT '[]',
+            manually_complete INTEGER DEFAULT 0,
             assistant_note TEXT DEFAULT '',
             pdf_source TEXT DEFAULT '',
             status TEXT DEFAULT 'active',
@@ -48,6 +49,7 @@ def init_db():
             event_id INTEGER NOT NULL,
             author TEXT NOT NULL DEFAULT '',
             text TEXT NOT NULL DEFAULT '',
+            images TEXT DEFAULT '[]',
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP
         )
@@ -56,9 +58,17 @@ def init_db():
     # Small key/value table for one-time bookkeeping (e.g. migration flags).
     conn.execute('CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)')
     _migrate(conn)
+    _migrate_notes(conn)
     _migrate_assistant_notes(conn)
     conn.commit()
     conn.close()
+
+
+def _migrate_notes(conn):
+    """Add columns that may be missing from the notes table in older databases."""
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(notes)").fetchall()}
+    if "images" not in cols:
+        conn.execute("ALTER TABLE notes ADD COLUMN images TEXT DEFAULT '[]'")
 
 
 def _migrate(conn):
@@ -71,6 +81,7 @@ def _migrate(conn):
         ("layout_image",   "ALTER TABLE events ADD COLUMN layout_image TEXT DEFAULT ''"),
         ("layout_images",  "ALTER TABLE events ADD COLUMN layout_images TEXT DEFAULT '[]'"),
         ("checked_items",  "ALTER TABLE events ADD COLUMN checked_items TEXT DEFAULT '[]'"),
+        ("manually_complete", "ALTER TABLE events ADD COLUMN manually_complete INTEGER DEFAULT 0"),
         ("assistant_note", "ALTER TABLE events ADD COLUMN assistant_note TEXT DEFAULT ''"),
         ("status",         "ALTER TABLE events ADD COLUMN status TEXT DEFAULT 'active'"),
         ("hidden",         "ALTER TABLE events ADD COLUMN hidden INTEGER DEFAULT 0"),
@@ -325,6 +336,7 @@ def get_events(start: str = None, end: str = None) -> list[dict]:
             e['checked_items'] = json.loads(e.get('checked_items') or '[]')
         except (json.JSONDecodeError, TypeError):
             e['checked_items'] = []
+        e['manually_complete'] = bool(e.get('manually_complete', 0))
         _decode_layout_images(e)
         e['note_count'] = note_counts.get(e['id'], 0)
         result.append(e)
@@ -345,6 +357,7 @@ def get_event_by_id(event_id: int) -> dict | None:
             e['checked_items'] = json.loads(e.get('checked_items') or '[]')
         except (json.JSONDecodeError, TypeError):
             e['checked_items'] = []
+        e['manually_complete'] = bool(e.get('manually_complete', 0))
         _decode_layout_images(e)
         return e
     return None
@@ -358,10 +371,12 @@ def delete_event(event_id: int):
     conn.close()
 
 
-def set_event_progress(event_id: int, checked_items=None, assistant_note=None) -> bool:
-    """Save an assistant's per-event progress (ticked setup items and/or a note).
+def set_event_progress(event_id: int, checked_items=None, assistant_note=None,
+                       manually_complete=None) -> bool:
+    """Save an assistant's per-event progress (ticked setup items, a note, and/or
+    an explicit "mark complete" flag).
 
-    Only the arguments that are not None are written, so the two can be updated
+    Only the arguments that are not None are written, so each can be updated
     independently. These fields are never touched by PDF re-uploads.
     Returns True if the event exists.
     """
@@ -373,6 +388,9 @@ def set_event_progress(event_id: int, checked_items=None, assistant_note=None) -
     if assistant_note is not None:
         sets.append('assistant_note=?')
         params.append(assistant_note)
+    if manually_complete is not None:
+        sets.append('manually_complete=?')
+        params.append(1 if manually_complete else 0)
 
     ok = True
     if sets:
@@ -421,7 +439,17 @@ def set_events_hidden(event_ids: list[int], hidden: bool) -> int:
 
 # ── Notes (append-only, attributed) ────────────────────────────────────────────
 
-_NOTE_COLS = "id, event_id, author, text, created_at, updated_at"
+_NOTE_COLS = "id, event_id, author, text, images, created_at, updated_at"
+
+
+def _decode_note(row) -> dict:
+    """Row → dict with `images` parsed from its JSON list."""
+    n = dict(row)
+    try:
+        n['images'] = json.loads(n.get('images') or '[]')
+    except (json.JSONDecodeError, TypeError):
+        n['images'] = []
+    return n
 
 
 def get_notes(event_id: int) -> list[dict]:
@@ -432,22 +460,22 @@ def get_notes(event_id: int) -> list[dict]:
         (event_id,),
     ).fetchall()
     conn.close()
-    return [dict(r) for r in rows]
+    return [_decode_note(r) for r in rows]
 
 
-def add_note(event_id: int, author: str, text: str) -> dict:
-    """Append a new note and return the created row."""
+def add_note(event_id: int, author: str, text: str, images=None) -> dict:
+    """Append a new note (optionally with attached image filenames) and return it."""
     conn = get_connection()
     cur = conn.execute(
-        "INSERT INTO notes (event_id, author, text) VALUES (?, ?, ?)",
-        (event_id, author, text),
+        "INSERT INTO notes (event_id, author, text, images) VALUES (?, ?, ?, ?)",
+        (event_id, author, text, json.dumps(images or [])),
     )
     row = conn.execute(
         f"SELECT {_NOTE_COLS} FROM notes WHERE id=?", (cur.lastrowid,)
     ).fetchone()
     conn.commit()
     conn.close()
-    return dict(row)
+    return _decode_note(row)
 
 
 def update_note(note_id: int, author: str, text: str) -> dict | None:
@@ -468,19 +496,30 @@ def update_note(note_id: int, author: str, text: str) -> dict | None:
         ).fetchone()
     conn.commit()
     conn.close()
-    return dict(row) if row else None
+    return _decode_note(row) if row else None
 
 
-def delete_note(note_id: int, author: str) -> bool:
-    """Delete a note, but only if `author` matches. Returns True on success."""
+def delete_note(note_id: int, author: str) -> list | None:
+    """Delete a note, but only if `author` matches.
+
+    Returns the deleted note's list of image filenames (so the caller can remove
+    the files), or None if it didn't exist or wasn't the author's to delete.
+    """
     conn = get_connection()
-    cur = conn.execute(
-        "DELETE FROM notes WHERE id=? AND author=?", (note_id, author)
-    )
-    ok = cur.rowcount > 0
+    row = conn.execute(
+        "SELECT images FROM notes WHERE id=? AND author=?", (note_id, author)
+    ).fetchone()
+    if row is None:
+        conn.close()
+        return None
+    try:
+        images = json.loads(row['images'] or '[]')
+    except (json.JSONDecodeError, TypeError):
+        images = []
+    conn.execute("DELETE FROM notes WHERE id=? AND author=?", (note_id, author))
     conn.commit()
     conn.close()
-    return ok
+    return images
 
 
 def delete_events_in_range(start_date: str, end_date: str) -> int:

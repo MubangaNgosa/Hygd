@@ -68,6 +68,8 @@ function renderIdentity() {
 // ── Notes thread (append-only, attributed, 4s polling while modal open) ────
 let _notesPollTimer = null;
 let _currentNotes   = [];
+let _noteImages     = [];      // File objects staged for the next note post
+const _MAX_NOTE_IMAGES = 10;
 let _notesTouched   = false;   // note count changed while modal open → refresh line indicators on close
 let _checklistTouched = false; // setup checkboxes changed → refresh complete-state styling on close
 
@@ -113,15 +115,36 @@ function renderNotes(notes) {
           <button class="note-action" title="Edit" onclick="App.editNote(${n.id})"><i class="bi bi-pencil"></i></button>
           <button class="note-action" title="Delete" onclick="App.deleteNote(${n.id})"><i class="bi bi-trash3"></i></button>
         </span>` : '';
+    const imgs = (n.images || []).length
+      ? `<div class="note-images">${n.images.map(fn => `
+           <a href="/note-images/${encodeURIComponent(fn)}" target="_blank" rel="noopener"
+              title="Open full-size photo">
+             <img class="note-image-thumb" src="/note-images/${encodeURIComponent(fn)}"
+                  alt="Photo attached by ${escHtml(n.author)}" loading="lazy">
+           </a>`).join('')}</div>`
+      : '';
     return `<div class="note-item${mine ? ' mine' : ''}" data-note-id="${n.id}">
         <div class="note-head">
           <span class="note-author">${escHtml(n.author)}</span>
           <span class="note-time">${escHtml(stamp)}</span>
           ${actions}
         </div>
-        <div class="note-text">${escHtml(n.text).replace(/\n/g, '<br>')}</div>
+        ${n.text ? `<div class="note-text">${escHtml(n.text).replace(/\n/g, '<br>')}</div>` : ''}
+        ${imgs}
       </div>`;
   }).join('');
+}
+
+// Show staged (not-yet-posted) photo thumbnails with a remove button each.
+function renderNoteImagePreview() {
+  const box = document.getElementById('note-image-preview');
+  if (!box) return;
+  box.innerHTML = _noteImages.map((f, i) => `
+    <span class="note-image-chip">
+      <img src="${URL.createObjectURL(f)}" alt="${escHtml(f.name)}">
+      <button type="button" class="note-image-remove" title="Remove"
+              onclick="App.removeNoteImage(${i})">&times;</button>
+    </span>`).join('');
 }
 
 function startNotesPoll(eventId) {
@@ -150,7 +173,11 @@ let ALL_EVENTS = [];
 let _eventsById = {};
 let groupedMode = false;
 let showHidden  = false;   // reveal events that users have hidden
-let showPast    = false;   // reveal events whose group's last instance has passed
+// Past events are shown by default (greyed + badged, never auto-hidden). The
+// "past" detection currently mis-flags some events that haven't started yet
+// (suspected server-vs-venue timezone mismatch in group_past), so auto-hiding is
+// disabled until that's fixed — the toggle can still collapse them manually.
+let showPast    = true;    // reveal events whose group's last instance has passed
 const FILTERS = { depts: new Set(), q: '', cancelledOnly: false };
 let _searchTimer = null;   // debounce handle for the search box
 
@@ -242,6 +269,7 @@ document.addEventListener('DOMContentLoaded', () => {
   document.getElementById('eventModal').addEventListener('hide.bs.modal', () => {
     stopNotesPoll();
     _currentEventId = null;
+    _noteImages = [];          // discard any photos staged but not posted
     if (_notesTouched || _checklistTouched) {
       _notesTouched = false;
       _checklistTouched = false;
@@ -395,8 +423,11 @@ function updateFilterMeta(total) {
   clear.classList.toggle('d-none', !active);
 }
 
-// An event is "complete" once every setup item has been checked off.
+// An event is "complete" when it's been explicitly marked done, OR (for events
+// that carry setup items) once every item has been checked off. The manual flag
+// is the only path for events with no tickable items.
 function eventIsComplete(p) {
+  if (p.manually_complete) return true;
   const total = (p.setup_items || []).length;
   if (!total) return false;
   const checked = (p.checked_items || []).filter(i => i < total).length;
@@ -711,6 +742,27 @@ function showEventModal(event) {
        </div>`
     : '';
 
+  // Explicit "mark complete" control. Always shown — it's the only way to
+  // complete an event that has no tickable items, and an override for one where
+  // some items don't apply. When all items are already ticked the event is
+  // complete regardless; the toggle then just reflects that state.
+  const manualComplete = !!props.manually_complete;
+  // The "manual override" hint only makes sense when there ARE items and they
+  // aren't all ticked. For a no-item event the toggle is the normal path, so no
+  // hint is shown.
+  const showHint = manualComplete && items.length > 0 && !setupComplete;
+  const completeHtml = `
+    <div class="complete-section mb-3">
+      <label class="complete-toggle${manualComplete ? ' on' : ''}">
+        <input type="checkbox" id="mark-complete" ${manualComplete ? 'checked' : ''}>
+        <i class="bi ${manualComplete ? 'bi-check-circle-fill' : 'bi-circle'} me-2"></i>
+        <span>${manualComplete ? 'Marked complete' : 'Mark this event complete'}</span>
+      </label>
+      <p class="complete-hint${showHint ? '' : ' d-none'}" id="complete-hint">
+        <i class="bi bi-info-circle me-1"></i>Completed manually — not every item is ticked.
+      </p>
+    </div>`;
+
   // Notes — append-only, attributed thread. Everyone adds their own entry, so
   // simultaneous editors never overwrite each other. Rendered by loadNotes().
   const assistHtml = `
@@ -722,9 +774,18 @@ function showEventModal(event) {
       <div class="notes-add mt-2">
         <textarea id="note-input" class="form-control" rows="2"
                   placeholder="Add a note as ${escHtml(getUsername() || 'you')}…"></textarea>
-        <button class="btn btn-primary btn-sm mt-2" id="note-add-btn" onclick="App.postNote()">
-          <i class="bi bi-send me-1"></i>Add note
-        </button>
+        <div class="note-image-preview" id="note-image-preview"></div>
+        <input type="file" id="note-image-input" accept="image/*" multiple hidden
+               onchange="App.onNoteImagesPicked()">
+        <div class="notes-add-actions mt-2">
+          <button class="btn btn-outline-secondary btn-sm" id="note-photo-btn"
+                  onclick="document.getElementById('note-image-input').click()">
+            <i class="bi bi-image me-1"></i>Add photo
+          </button>
+          <button class="btn btn-primary btn-sm" id="note-add-btn" onclick="App.postNote()">
+            <i class="bi bi-send me-1"></i>Add note
+          </button>
+        </div>
       </div>
     </div>`;
 
@@ -815,6 +876,7 @@ function showEventModal(event) {
     <hr>
     ${layoutHtml}
     ${setupHtml}
+    ${completeHtml}
     ${notesHtml}
     ${assistHtml}
     ${sourceHtml}
@@ -844,6 +906,39 @@ function wireProgressControls(id) {
       saveProgress(id);
     });
   });
+
+  const mark = document.getElementById('mark-complete');
+  if (mark) mark.addEventListener('change', () => saveManualComplete(id, mark.checked));
+}
+
+async function saveManualComplete(id, complete) {
+  const body = document.getElementById('event-modal-body');
+
+  // Reflect the new state in the toggle's label/icon and the manual hint.
+  const toggle = body.querySelector('.complete-toggle');
+  if (toggle) {
+    toggle.classList.toggle('on', complete);
+    const icon = toggle.querySelector('i.bi');
+    if (icon) icon.className = `bi ${complete ? 'bi-check-circle-fill' : 'bi-circle'} me-2`;
+    const txt = toggle.querySelector('span');
+    if (txt) txt.textContent = complete ? 'Marked complete' : 'Mark this event complete';
+  }
+  const hint  = document.getElementById('complete-hint');
+  const total = body.querySelectorAll('.item-check').length;
+  const done  = body.querySelectorAll('.item-check:checked').length;
+  if (hint) hint.classList.toggle('d-none', !(complete && total > 0 && done < total));
+
+  updateManualCompleteCache(id, complete);   // optimistic
+  _checklistTouched = true;                   // refresh line styling on close
+
+  try {
+    const res = await fetch(`/api/events/${id}/progress`, {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ manually_complete: complete }),
+    });
+    if (!res.ok) throw new Error('save failed');
+  } catch (_) {}
 }
 
 async function saveProgress(id) {
@@ -855,6 +950,14 @@ async function saveProgress(id) {
   if (prog) {
     prog.textContent = progressLabel(checked.length, total);
     prog.classList.toggle('complete', total > 0 && checked.length >= total);
+  }
+
+  // Keep the "completed manually" hint accurate as items are ticked/unticked.
+  const mark = document.getElementById('mark-complete');
+  const hint = document.getElementById('complete-hint');
+  if (hint) {
+    const overriding = mark && mark.checked && total > 0 && checked.length < total;
+    hint.classList.toggle('d-none', !overriding);
   }
 
   updateProgressCache(id, checked);   // optimistic — keeps this session in sync
@@ -876,6 +979,14 @@ function updateProgressCache(id, checked) {
   if (raw) raw.extendedProps.checked_items = checked;
   const fcEv = calendar.getEventById(String(id));
   if (fcEv) fcEv.setExtendedProp('checked_items', checked);
+}
+
+// Mirror the manual "mark complete" flag into the in-memory caches
+function updateManualCompleteCache(id, complete) {
+  const raw = _eventsById[id];
+  if (raw) raw.extendedProps.manually_complete = complete;
+  const fcEv = calendar.getEventById(String(id));
+  if (fcEv) fcEv.setExtendedProp('manually_complete', complete);
 }
 
 // ── Upload ────────────────────────────────────────────────────────────────
@@ -1138,23 +1249,55 @@ const App = {
     }
   },
 
+  // Stage newly picked photos (appended, deduped by name+size, capped) and show
+  // previews. Clears the input so picking the same file again still fires change.
+  onNoteImagesPicked() {
+    const input = document.getElementById('note-image-input');
+    if (!input) return;
+    for (const f of input.files) {
+      if (_noteImages.length >= _MAX_NOTE_IMAGES) break;
+      if (_noteImages.some(g => g.name === f.name && g.size === f.size)) continue;
+      _noteImages.push(f);
+    }
+    input.value = '';
+    renderNoteImagePreview();
+  },
+
+  removeNoteImage(idx) {
+    _noteImages.splice(idx, 1);
+    renderNoteImagePreview();
+  },
+
   async postNote() {
     let name = getUsername();
     if (!name) { App.changeName(); name = getUsername(); if (!name) return; }
     const input = document.getElementById('note-input');
     const text  = (input.value || '').trim();
-    if (!text || _currentEventId == null) return;
+    if ((!text && !_noteImages.length) || _currentEventId == null) return;
 
     const btn = document.getElementById('note-add-btn');
     if (btn) btn.disabled = true;
     try {
-      const res = await fetch(`/api/events/${_currentEventId}/notes`, {
-        method:  'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body:    JSON.stringify({ author: name, text }),
-      });
+      let opts;
+      if (_noteImages.length) {
+        // Photos require multipart/form-data — let the browser set the boundary.
+        const fd = new FormData();
+        fd.append('author', name);
+        fd.append('text', text);
+        for (const f of _noteImages) fd.append('images', f);
+        opts = { method: 'POST', body: fd };
+      } else {
+        opts = {
+          method:  'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body:    JSON.stringify({ author: name, text }),
+        };
+      }
+      const res = await fetch(`/api/events/${_currentEventId}/notes`, opts);
       if (res.ok) {
         input.value = '';
+        _noteImages = [];
+        renderNoteImagePreview();
         await loadNotes(_currentEventId);
       }
     } finally {
