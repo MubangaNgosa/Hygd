@@ -216,10 +216,41 @@ let showPast    = true;    // reveal events whose group's last instance has pass
 const FILTERS = { depts: new Set(), q: '', cancelledOnly: false };
 let _searchTimer = null;   // debounce handle for the search box
 
+// ── Saved filters (per-browser) ───────────────────────────────────────────
+// Department chips, search text and the cancelled toggle survive a reload, so
+// e.g. Security staff land straight on their own events each visit.
+const FILTERS_KEY = 'hygd_filters';
+
+function saveFilters() {
+  const search = document.getElementById('event-search');
+  const saved = {
+    depts: [...FILTERS.depts],
+    q: search ? search.value : FILTERS.q,
+    cancelledOnly: FILTERS.cancelledOnly,
+  };
+  try { localStorage.setItem(FILTERS_KEY, JSON.stringify(saved)); } catch (_) {}
+}
+
+function loadFilters() {
+  let saved;
+  try { saved = JSON.parse(localStorage.getItem(FILTERS_KEY) || 'null'); } catch (_) { return; }
+  if (!saved || typeof saved !== 'object') return;
+  if (Array.isArray(saved.depts)) {
+    saved.depts.forEach(d => { if (typeof d === 'string') FILTERS.depts.add(d); });
+  }
+  if (typeof saved.q === 'string') {
+    FILTERS.q = saved.q.trim().toLowerCase();
+    const search = document.getElementById('event-search');
+    if (search) search.value = saved.q;
+  }
+  FILTERS.cancelledOnly = saved.cancelledOnly === true;
+}
+
 // ── FullCalendar ──────────────────────────────────────────────────────────
 let calendar;
 
 document.addEventListener('DOMContentLoaded', () => {
+  loadFilters();   // before the first fetch, so it renders already filtered
   const el = document.getElementById('calendar');
 
   calendar = new FullCalendar.Calendar(el, {
@@ -450,6 +481,9 @@ function buildFilterBar(list) {
     const cat = e.extendedProps.dept_category || 'General';
     counts[cat] = (counts[cat] || 0) + 1;
   }
+  // A saved/active department with nothing in this range still gets a chip,
+  // so whatever is filtering the view stays visible and can be switched off.
+  for (const cat of FILTERS.depts) if (!(cat in counts)) counts[cat] = 0;
 
   const chipWrap = document.getElementById('dept-filters');
   const cats = Object.keys(counts).sort((a, b) => counts[b] - counts[a] || a.localeCompare(b));
@@ -1178,11 +1212,13 @@ const App = {
   toggleDept(cat) {
     if (FILTERS.depts.has(cat)) FILTERS.depts.delete(cat);
     else                        FILTERS.depts.add(cat);
+    saveFilters();
     calendar.refetchEvents();
   },
 
   setSearch(text) {
     FILTERS.q = (text || '').trim().toLowerCase();
+    saveFilters();
     // Debounce so we don't re-render on every keystroke
     clearTimeout(_searchTimer);
     _searchTimer = setTimeout(() => {
@@ -1193,6 +1229,7 @@ const App = {
 
   toggleCancelled() {
     FILTERS.cancelledOnly = !FILTERS.cancelledOnly;
+    saveFilters();
     calendar.refetchEvents();
   },
 
@@ -1202,6 +1239,7 @@ const App = {
     FILTERS.cancelledOnly = false;
     const search = document.getElementById('event-search');
     if (search) search.value = '';
+    saveFilters();
     calendar.refetchEvents();
   },
 
