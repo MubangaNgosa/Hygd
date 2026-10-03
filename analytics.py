@@ -45,24 +45,53 @@ def semester_of(date_str: str) -> tuple[str, int] | None:
 
 # ── Department bucketing (single source of truth, shared with app.py) ───────────
 
+# Checked in order against the department (provider) label.
+_DEPT_RULES = [
+    ("Facilities",      re.compile(r"facilit")),
+    ("AV / Production", re.compile(r"audio|a/v|sfu live")),
+    ("Security",        re.compile(r"security")),
+    ("Catering",        re.compile(r"food|beverage|cater")),
+    ("Parking",         re.compile(r"parking")),
+    ("Event Services",  re.compile(r"event services?")),
+]
+
+# Fallback when a booking has no provider line, so the department is blank and
+# only the function/service type says who does the work (e.g. an exam lock-up
+# typed "Security"). Word-bounded and stricter than the department rules,
+# since service types are free text ("Lorne Davies Gym" must not read as AV).
+_SERVICE_RULES = [
+    ("Facilities",      re.compile(r"\bfacilit|\bmaintenance\b")),
+    ("AV / Production", re.compile(r"\baudio\b|\bav\b|\ba/v\b")),
+    ("Security",        re.compile(r"\bsecurity\b|\b(un)?lock\b")),
+    ("Catering",        re.compile(r"\bcatering\b|\bfood\b|\bbeverage\b")),
+    ("Parking",         re.compile(r"\bparking\b")),
+]
+
+# Service types that name a department only to say it isn't needed ("No AV",
+# "AV organized by client", "Parking - on their own") stay General.
+_SERVICE_NEGATION = re.compile(r"\bno\b|\bby client\b|\bclient contact|\bon their own\b")
+
+
 def dept_category(department: str, service_type: str) -> str:
     """Bucket a raw department/service label into a small filterable set."""
     d = (department or "").lower()
     s = (service_type or "").lower()
-    if "facilit" in d:
-        return "Facilities"
-    if "audio" in d or "a/v" in d or "sfu live" in d or "av" == s.strip():
+    if d.strip() == "event details":
+        # A notes heading, not a provider (older uploads stored it as one) —
+        # categorise by the service type instead.
+        d = ""
+    if s.strip() == "av":
         return "AV / Production"
-    if "security" in d:
-        return "Security"
-    if "food" in d or "beverage" in d or "cater" in d:
-        return "Catering"
-    if "parking" in d:
-        return "Parking"
-    if "event services" in d or "event service" in d:
-        return "Event Services"
-    if department:
+    if d:
+        for category, pattern in _DEPT_RULES:
+            if pattern.search(d):
+                return category
         return department  # keep any other named provider as its own bucket
+    if _SERVICE_NEGATION.search(s):
+        return "General"
+    for category, pattern in _SERVICE_RULES:
+        if pattern.search(s):
+            return category
     return "General"
 
 

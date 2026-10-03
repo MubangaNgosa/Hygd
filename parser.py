@@ -499,6 +499,28 @@ _BS_BOOKING_RE = re.compile(r'^#(\d+)$')
 _BS_TIME_RE    = re.compile(r'(\d{1,2}:\d{2})\D+(\d{1,2}:\d{2})')
 _BS_ATT_RE     = re.compile(r'^\(?(\d+)\s*PPL\)?$', re.IGNORECASE)
 _BS_ONSITE_RE  = re.compile(r'^(.*?)Onsite:\s*(.*)$')
+# A provider heading with no onsite contact, e.g. "Security Burnaby:" ·
+# "Audio/Visual Services:" · "Event Status: Tentative Parking:". It also opens
+# a second provider's section mid-event, so it must never read as item text.
+_BS_PROVIDERS = (r'Audio/Visual Services|Food & Beverage\b.*|Security\b.*'
+                 r'|Facilities Services|Event Details|Event Services|Parking|SFU LIVE')
+_BS_PROVIDER_RE = re.compile(rf'^(?:Event Status:\s*(.*?)\s+)?({_BS_PROVIDERS}):$')
+# What follows "Event Status:" — a status of one or more words ("Tentative",
+# "Sent to Contract"), optionally followed by the provider heading.
+_BS_STATUS_RE = re.compile(rf'^(.*?)(?:\s+({_BS_PROVIDERS}):)?$')
+# Headings that open a notes section rather than naming who does the work.
+# They are never taken as the department, so the function's own service type
+# (or a later provider heading) decides its category instead.
+_BS_NOT_PROVIDERS = {'event details'}
+
+
+def _set_bs_department(ev: dict, provider: str) -> None:
+    """Record the provider heading as the event's department. The first real
+    provider heads the function; later ones are secondary sections (e.g.
+    Event Services notes) and don't overwrite it."""
+    provider = provider.rstrip(':').strip()
+    if provider and provider.lower() not in _BS_NOT_PROVIDERS and not ev.get('department'):
+        ev['department'] = provider
 # Item rows carry a quantity and a price before the unit, e.g.
 #   "1.0 0.00 EA Room Set Diagram" · "13.0 40.00 /HR Technician" · "1.0 (350.00)EA Discount"
 _BS_ITEM_RE    = re.compile(
@@ -687,12 +709,21 @@ def _parse_by_space_pdf(pdf_path: str) -> list[dict]:
                     prefix, onsite = om.group(1).strip(), om.group(2).strip()
                     current_ev['onsite_contact'] = onsite
                     if 'Event Status:' in prefix:
-                        status = prefix.split('Event Status:', 1)[1].strip()
+                        # "Tentative" · "Sent to Contract Facilities Services:"
+                        sm = _BS_STATUS_RE.match(prefix.split('Event Status:', 1)[1].strip())
+                        status, prefix = sm.group(1), sm.group(2) or ''
                         if _CANCEL_RE.search(status):
                             current_ev['cancelled'] = True
-                    elif prefix:
-                        # The prefix names the department/service provider
-                        current_ev['department'] = prefix.rstrip(':').strip()
+                    # The prefix names the department/service provider
+                    _set_bs_department(current_ev, prefix)
+                    continue
+
+                pm = _BS_PROVIDER_RE.match(text)
+                if pm:
+                    status, provider = pm.group(1), pm.group(2)
+                    if status and _CANCEL_RE.search(status):
+                        current_ev['cancelled'] = True
+                    _set_bs_department(current_ev, provider)
                     continue
 
                 # Item row — "1.0 0.00 EA Room Set Diagram"
