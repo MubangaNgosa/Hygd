@@ -706,10 +706,30 @@ body {
 }
 .ev-room .bi { font-size: .8em; opacity: .8; }
 .note-flag {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
   margin-left: 5px;
-  color: #f0a020;
-  font-size: .85em;
-  vertical-align: baseline;
+  padding: 0 6px;
+  border-radius: 10px;
+  background: #f1f3f5;
+  color: #6c757d;
+  font-size: .72em;
+  font-weight: 600;
+  vertical-align: middle;
+}
+.note-flag .bi { font-size: .95em; }
+.note-flag.has-unseen {
+  background: #fff3cd;
+  color: #97650c;
+}
+.note-flag.has-unseen::after {
+  content: '';
+  width: 6px;
+  height: 6px;
+  margin-left: 2px;
+  border-radius: 50%;
+  background: #e8590c;
 }
 .hidden-flag {
   margin-left: 5px;
@@ -1216,6 +1236,14 @@ body {
     background: #1e1b4b;
     color: #a5b4fc;
     border-color: #3730a3;
+  }
+  .note-flag {
+    background: #252837;
+    color: #a5adc4;
+  }
+  .note-flag.has-unseen {
+    background: #4a3a10;
+    color: #f5c869;
   }
   .ev-room {
     background: #252837;

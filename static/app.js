@@ -65,6 +65,36 @@ function renderIdentity() {
     : `<a href="#" onclick="App.changeName();return false;">Set your name</a>`;
 }
 
+// ── "Seen" comment tracking (per-browser, no accounts) ─────────────────────
+// Remembers how many notes we'd already seen on each event, so a new one
+// posted by someone else shows up as an unread indicator until we open it.
+const SEEN_NOTES_KEY = 'hygd_seen_notes';
+
+function _seenNotesMap() {
+  try { return JSON.parse(localStorage.getItem(SEEN_NOTES_KEY) || '{}'); } catch (_) { return {}; }
+}
+
+function getSeenNoteCount(id) {
+  return _seenNotesMap()[id] || 0;
+}
+
+// Records that we've viewed `count` notes on this event. Flags the view as
+// dirty when that clears a pending "unseen" state, so the calendar / grouped
+// panel refresh their indicators once the modal closes.
+function markNotesSeen(id, count) {
+  const map = _seenNotesMap();
+  if (map[id] === count) return;
+  map[id] = count;
+  try { localStorage.setItem(SEEN_NOTES_KEY, JSON.stringify(map)); } catch (_) {}
+  _notesTouched = true;
+}
+
+// How many of an event's notes haven't been viewed in this browser yet.
+function unseenNoteCount(id, props) {
+  const total = (props && props.note_count) || 0;
+  return total ? Math.max(0, total - getSeenNoteCount(id)) : 0;
+}
+
 // ── Notes thread (append-only, attributed, 4s polling while modal open) ────
 let _notesPollTimer = null;
 let _currentNotes   = [];
@@ -80,6 +110,7 @@ async function loadNotes(eventId) {
     _currentNotes = await res.json();
     renderNotes(_currentNotes);
     syncNoteCount(eventId, _currentNotes.length);
+    markNotesSeen(eventId, _currentNotes.length);
   } catch (_) {}
 }
 
@@ -100,6 +131,10 @@ function renderNotes(notes) {
   if (!list) return;
   // Don't stomp on an inline edit that's in progress (e.g. a poll tick)
   if (list.querySelector('.note-item.editing')) return;
+
+  const syncEl = document.getElementById('notes-sync');
+  if (syncEl) syncEl.textContent = notes.length
+    ? `${notes.length} comment${notes.length !== 1 ? 's' : ''}` : '';
 
   if (!notes.length) {
     list.innerHTML = '<div class="notes-empty text-muted small">No notes yet — add the first one below.</div>';
@@ -256,6 +291,15 @@ document.addEventListener('DOMContentLoaded', () => {
   calendar.render();
   refreshBadge();
 
+  // Background refresh so a comment someone else adds shows up as a live
+  // notification (unseen badge / ★ flag) without needing a manual reload.
+  // Skipped while an event's notes are already open — that thread has its
+  // own 4s poll — and while the tab is in the background.
+  setInterval(() => {
+    if (document.hidden || _currentEventId != null) return;
+    calendar.refetchEvents();
+  }, 60000);
+
   // Swap the calendar toolbar for a compact one when crossing the mobile
   // breakpoint. Driven off window resize so it also fires on orientation change.
   let _wasMobile = isMobile();
@@ -273,6 +317,7 @@ document.addEventListener('DOMContentLoaded', () => {
     if (_notesTouched || _checklistTouched) {
       _notesTouched = false;
       _checklistTouched = false;
+      updateUnseenBadge();
       if (groupedMode) renderGrouped(applyFilters(ALL_EVENTS));
       else             calendar.refetchEvents();
     }
@@ -344,6 +389,23 @@ function updatePastButton() {
     (showPast ? 'Showing past' : 'Show past') + (count ? ` (${count})` : '');
 }
 
+// Header pill: total unseen comments across every loaded event, so a new one
+// posted anywhere is noticeable without opening the calendar row it's on.
+function updateUnseenBadge() {
+  const badge = document.getElementById('unseen-badge');
+  if (!badge) return;
+  let totalUnseen = 0, eventsWithUnseen = 0;
+  for (const e of ALL_EVENTS) {
+    const n = unseenNoteCount(e.id, e.extendedProps);
+    if (n > 0) { totalUnseen += n; eventsWithUnseen++; }
+  }
+  badge.classList.toggle('d-none', totalUnseen === 0);
+  if (totalUnseen > 0) {
+    badge.innerHTML = `<i class="bi bi-chat-dots-fill me-1"></i>${totalUnseen} new comment${totalUnseen !== 1 ? 's' : ''}`;
+    badge.title = `${eventsWithUnseen} event${eventsWithUnseen !== 1 ? 's' : ''} with new comments`;
+  }
+}
+
 // ── Event fetching + filtering ────────────────────────────────────────────
 async function fetchEvents(info, success, failure) {
   try {
@@ -357,6 +419,7 @@ async function fetchEvents(info, success, failure) {
     buildLegend(ALL_EVENTS);
     updateHiddenButton();
     updatePastButton();
+    updateUnseenBadge();
     if (groupedMode) renderGrouped(applyFilters(ALL_EVENTS));
     success(applyFilters(ALL_EVENTS));
   } catch (err) {
@@ -478,10 +541,13 @@ function decorateEvent(info, isList) {
     titleEl.appendChild(s);
   }
   if (p.note_count > 0 && !titleEl.querySelector('.note-flag')) {
+    const unseen = unseenNoteCount(info.event.id, p);
     const s = document.createElement('span');
-    s.className = 'note-flag';
-    s.textContent = '★';
-    s.title = `${p.note_count} note${p.note_count !== 1 ? 's' : ''}`;
+    s.className = 'note-flag' + (unseen > 0 ? ' has-unseen' : '');
+    s.innerHTML = `<i class="bi bi-chat-dots-fill"></i> ${p.note_count}`;
+    s.title = unseen > 0
+      ? `${p.note_count} comment${p.note_count !== 1 ? 's' : ''} — ${unseen} new`
+      : `${p.note_count} comment${p.note_count !== 1 ? 's' : ''}`;
     titleEl.appendChild(s);
   }
   if (p.hidden && !titleEl.querySelector('.hidden-flag')) {
@@ -619,8 +685,9 @@ function renderGrouped(list) {
       const deptTag = p.dept_category && p.dept_category !== 'General'
         ? `<span class="dept-tag">${escHtml(p.dept_category)}</span>` : '';
       const flag = p.layout_image ? '<span class="ev-flag" title="Room layout available">🗺</span>' : '';
+      const unseen = unseenNoteCount(e.id, p);
       const noteFlag = p.note_count > 0
-        ? `<span class="note-flag" title="${p.note_count} note${p.note_count !== 1 ? 's' : ''}">★</span>` : '';
+        ? `<span class="note-flag${unseen > 0 ? ' has-unseen' : ''}" title="${p.note_count} comment${p.note_count !== 1 ? 's' : ''}${unseen > 0 ? ` — ${unseen} new` : ''}"><i class="bi bi-chat-dots-fill"></i> ${p.note_count}</span>` : '';
       const hiddenFlag = p.hidden
         ? '<span class="hidden-flag" title="Hidden event"><i class="bi bi-eye-slash"></i></span>' : '';
       const complete = eventIsComplete(p);
