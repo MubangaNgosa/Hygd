@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Hygd — Comments Report</title>
+
+  <!-- Bootstrap 5 -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css">
+  <!-- Bootstrap Icons -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css">
+
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body class="report-body">
+
+<!-- ── Top navigation bar ─────────────────────────────────────────────────── -->
+<header class="app-header d-flex align-items-center px-4 no-print">
+  <div class="d-flex align-items-center gap-3 flex-grow-1">
+    <span class="header-logo">
+      <i class="bi bi-chat-square-text"></i>
+    </span>
+    <div>
+      <h1 class="header-title mb-0">Comments Report</h1>
+      <p class="header-sub mb-0">Every comment, with the event it belongs to</p>
+    </div>
+  </div>
+
+  <div class="d-flex align-items-center gap-2 header-actions">
+    <button class="btn btn-outline-light" onclick="window.print()" title="Print, or choose “Save as PDF”">
+      <i class="bi bi-printer me-1"></i><span class="btn-label">Print / PDF</span>
+    </button>
+    <a class="btn btn-primary"
+       href="/comments/report?format=csv{% if start %}&start={{ start }}{% endif %}{% if end %}&end={{ end }}{% endif %}"
+       title="Download as a spreadsheet (opens in Excel)">
+      <i class="bi bi-filetype-csv me-1"></i><span class="btn-label">Export CSV</span>
+    </a>
+    <a class="btn btn-outline-light" href="/" title="Back to the calendar">
+      <i class="bi bi-calendar2-week me-1"></i><span class="btn-label">Calendar</span>
+    </a>
+  </div>
+</header>
+
+<!-- ── Date range ──────────────────────────────────────────────────────────── -->
+<form class="filter-bar report-toolbar no-print" method="get" action="/comments/report">
+  <span class="filter-label"><i class="bi bi-calendar-range me-1"></i>Event dates</span>
+  <input type="date" name="start" value="{{ start }}" class="form-control form-control-sm report-date" aria-label="From">
+  <span class="text-muted">to</span>
+  <input type="date" name="end" value="{{ end }}" class="form-control form-control-sm report-date" aria-label="To">
+  <button class="btn btn-sm btn-primary" type="submit">Apply</button>
+  {% if start or end %}<a class="btn btn-sm btn-outline-secondary" href="/comments/report">All dates</a>{% endif %}
+</form>
+
+<main class="report-main">
+
+  <section class="report-summary">
+    <h2 class="report-title">Hygd — Comments Report</h2>
+    <p class="report-meta">
+      {% if start or end %}Events {{ start or 'start' }} → {{ end or 'latest' }}{% else %}All events{% endif %}
+      · Generated {{ generated }}
+    </p>
+    <div class="report-kpis">
+      <div><strong>{{ total_comments }}</strong><span>comment{{ '' if total_comments == 1 else 's' }}</span></div>
+      <div><strong>{{ events|length }}</strong><span>event{{ '' if events|length == 1 else 's' }}</span></div>
+      <div><strong>{{ authors|length }}</strong><span>contributor{{ '' if authors|length == 1 else 's' }}</span></div>
+    </div>
+    {% if authors %}<p class="report-meta">By: {{ authors|join(', ') }}</p>{% endif %}
+  </section>
+
+  {% if not events %}
+    <div class="report-empty">
+      <i class="bi bi-chat-square"></i>
+      <p>No comments {% if start or end %}on events in this date range{% else %}yet{% endif %}.</p>
+    </div>
+  {% endif %}
+
+  {% for ev in events %}
+  <article class="report-event{% if ev.status == 'cancelled' %} is-cancelled{% endif %}">
+    <header class="report-event-head">
+      <div>
+        <h3>{{ ev.event_name or '(untitled event)' }}
+          {% if ev.status == 'cancelled' %}<span class="badge bg-danger ms-1">Cancelled</span>{% endif %}
+        </h3>
+        <div class="report-event-when">
+          <i class="bi bi-calendar3 me-1"></i>{{ ev.date }}
+          {% if ev.start_time %} · {{ ev.start_time }}{% if ev.end_time %}–{{ ev.end_time }}{% endif %}{% endif %}
+          {% if ev.room %} · <i class="bi bi-geo-alt me-1"></i>{{ ev.room }}{% endif %}
+        </div>
+      </div>
+      <span class="report-count">{{ ev.comments|length }}</span>
+    </header>
+
+    <dl class="report-details">
+      {% if ev.event_number %}<div><dt>Event #</dt><dd>{{ ev.event_number }}</dd></div>{% endif %}
+      {% if ev.dept_category %}<div><dt>Department</dt><dd>{{ ev.dept_category }}</dd></div>{% endif %}
+      {% if ev.onsite_contact %}<div><dt>Onsite contact</dt><dd>{{ ev.onsite_contact }}</dd></div>{% endif %}
+      {% if ev.mecs_contact %}<div><dt>MECS contact</dt><dd>{{ ev.mecs_contact }}</dd></div>{% endif %}
+      {% if ev.attendance %}<div><dt>Attendance</dt><dd>{{ ev.attendance }}</dd></div>{% endif %}
+    </dl>
+
+    <ol class="report-comments">
+      {% for c in ev.comments %}
+      <li>
+        <div class="report-comment-meta">
+          <strong>{{ c.author or 'Anonymous' }}</strong>
+          <span>{{ c.when }}{% if c.edited %} · edited {{ c.edited }}{% endif %}</span>
+        </div>
+        <div class="report-comment-text">{{ c.text }}</div>
+        {% if c.images or c.reactions %}
+        <div class="report-comment-extra">
+          {% if c.images %}<span><i class="bi bi-image me-1"></i>{{ c.images|length }} image{{ '' if c.images|length == 1 else 's' }}</span>{% endif %}
+          {% for r in c.reactions %}<span title="{{ r.authors|join(', ') }}">{{ r.emoji }} {{ r.authors|length }}</span>{% endfor %}
+        </div>
+        {% endif %}
+      </li>
+      {% endfor %}
+    </ol>
+  </article>
+  {% endfor %}
+
+</main>
+</body>
+</html>

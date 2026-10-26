@@ -61,7 +61,7 @@ hygd/
 ├── static/
 │   ├── style.css       # Brand styling (Hygd indigo, light + dark)
 │   └── app.js          # Calendar, filters, grouped view, event modal
-├── uploads/            # Uploaded PDFs (auto-created)
+├── uploads/            # Uploaded PDFs, deleted after 90 days (auto-created)
 │   └── layouts/        # Extracted room-layout diagram PNGs (auto-created)
 └── events.db           # SQLite database (auto-created on first run)
 ```
@@ -129,8 +129,11 @@ Press **Ctrl + C** in the terminal. That releases port 5000.
 
 ### Notes
 
-- **`debug=True`** is on in `app.py`, so the server auto-reloads when you edit a
-  `.py` file. Editing `.html` / `.css` / `.js` only needs a browser refresh.
+- **`python app.py` is for local development only.** It listens on `127.0.0.1`
+  with the debugger off. `FLASK_DEBUG=1` turns on Flask's interactive debugger
+  (and auto-reload on `.py` edits), which lets anyone who can reach the port run
+  code on the machine, so never combine it with `HOST=0.0.0.0`. On a server,
+  always run Gunicorn. Editing `.html` / `.css` / `.js` only needs a browser refresh.
 - Uploading a PDF **adds** to what's already there. Use **Clear** in the app to
   wipe a date range (or everything) first. To reset completely, stop the app and
   delete `events.db` and the `uploads/layouts/` folder.
@@ -184,7 +187,7 @@ pip install -r requirements.txt
 ```bash
 cd /opt/hygd
 source .venv/bin/activate
-python app.py
+HOST=0.0.0.0 python app.py
 ```
 
 Open `http://your-server-ip:5000` in a browser. If the calendar loads, press `Ctrl+C` and continue to the next step.
@@ -288,7 +291,7 @@ The app is now live at `http://your-server-ip`.
    - With nginx:      `http://192.168.1.50`
    - Without nginx:   `http://192.168.1.50:5000`
 
-> The app binds to `0.0.0.0`, so it already accepts connections from other
+> Gunicorn binds to `0.0.0.0`, so it already accepts connections from other
 > devices — you only need the correct IP and an open firewall port. This is
 > LAN-only; nothing is exposed to the public internet.
 
@@ -302,6 +305,8 @@ The app is now live at `http://your-server-ip`.
 4. Events appear on the calendar instantly — click any one for full setup details
 
 > Uploading a new PDF **adds** to existing events. Use the **Clear** button first if you want to replace the calendar entirely with the new file.
+
+> Uploaded PDFs in `uploads/` are deleted after 90 days (checked on each upload); the events stay in the database. Note photos (`uploads/note_images/`) and layout diagrams (`uploads/layouts/`) are kept.
 
 ---
 
@@ -379,3 +384,22 @@ sudo systemctl restart hygd
 
 **Port 5000 already in use**
 - Another process is on that port. Change the port in the `.service` file (`-b 0.0.0.0:5001`) and update the nginx `proxy_pass` to match.
+
+---
+
+## Security
+
+Every response carries a Content-Security-Policy that only allows scripts, styles and fonts from the app and `cdn.jsdelivr.net` (Bootstrap, Bootstrap Icons, FullCalendar, Chart.js), plus `data:` fonts and images and `blob:` images for the note-photo preview. If you load a library from anywhere else, add its origin to `SECURITY_HEADERS` in `app.py` or the browser will block it. Inline `onclick=`/`style=`/`<script>` are still allowed (`'unsafe-inline'`) until they move into `static/`.
+
+Keep the server patched once:
+
+```bash
+sudo apt install unattended-upgrades && sudo dpkg-reconfigure -plow unattended-upgrades
+```
+
+And check the Python packages for known vulnerabilities before each deploy, and at least once a term:
+
+```bash
+/opt/hygd/.venv/bin/pip install pip-audit
+/opt/hygd/.venv/bin/pip-audit -r /opt/hygd/requirements.txt
+```

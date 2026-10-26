@@ -65,11 +65,109 @@ function renderIdentity() {
     : `<a href="#" onclick="App.changeName();return false;">Set your name</a>`;
 }
 
+// ── Unread comment tracking (per-browser, no accounts) ─────────────────────
+// Remembers the newest note id we've seen on each event. Note ids only ever
+// increase, so anything above it, written by someone else, is unread. Events
+// never opened in this browser fall back to a "floor" id set on first visit,
+// so a new browser doesn't flag every comment ever posted.
+const SEEN_NOTES_KEY  = 'hygd_seen_note_ids';  // { eventId: lastSeenNoteId }
+const SEEN_FLOOR_KEY  = 'hygd_seen_floor';
+const LEGACY_SEEN_KEY = 'hygd_seen_notes';     // old per-event *count* map
+
+let _unread = [];         // unread notes across all events, newest first
+let _unreadByEvent = {};  // eventId (string) → unread count
+
+function _seenIdMap() {
+  try { return JSON.parse(localStorage.getItem(SEEN_NOTES_KEY) || '{}'); } catch (_) { return {}; }
+}
+
+function _saveSeenIdMap(map) {
+  try { localStorage.setItem(SEEN_NOTES_KEY, JSON.stringify(map)); } catch (_) {}
+}
+
+// null until the first unread fetch has set it
+function _seenFloor() {
+  let v = NaN;
+  try { v = parseInt(localStorage.getItem(SEEN_FLOOR_KEY), 10); } catch (_) {}
+  return isNaN(v) ? null : v;
+}
+
+// Newest note id on this event we count as already seen.
+function lastSeenNoteId(id) {
+  const floor = _seenFloor();
+  // Before the floor exists we can't tell what's new, so treat it all as seen.
+  if (floor == null) return Number.MAX_SAFE_INTEGER;
+  return Math.max(floor, _seenIdMap()[id] || 0);
+}
+
+// Records that we've viewed every note in `notes` on this event, and drops the
+// event from the unread list. Flags the view as dirty when that clears unread
+// comments, so the calendar / grouped panel refresh their indicators on close.
+function markNotesSeen(id, notes) {
+  id = String(id);
+  const maxId = notes.reduce((m, n) => Math.max(m, n.id), 0);
+  const map = _seenIdMap();
+  if (maxId > (map[id] || 0)) { map[id] = maxId; _saveSeenIdMap(map); }
+  if (_unreadByEvent[id]) {
+    _unread = _unread.filter(n => String(n.event_id) !== id || n.id > maxId);
+    _indexUnread();
+    _notesTouched = true;
+    updateUnseenBadge();
+  }
+}
+
+// How many of an event's comments haven't been viewed in this browser yet.
+function unseenNoteCount(id) {
+  return _unreadByEvent[String(id)] || 0;
+}
+
+function _indexUnread() {
+  _unreadByEvent = {};
+  for (const n of _unread) {
+    const k = String(n.event_id);
+    _unreadByEvent[k] = (_unreadByEvent[k] || 0) + 1;
+  }
+}
+
+// Ask the server which comments are new for us — across every event, not just
+// the calendar's visible range — and refresh the header inbox.
+async function refreshUnread() {
+  const floor = _seenFloor();
+  try {
+    const res = await fetch('/api/comments/unread', {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ seen: _seenIdMap(), floor: floor ?? 0, me: getUsername() }),
+    });
+    if (!res.ok) return;
+    const data = await res.json();
+    if (floor == null) {
+      // First visit with id-based tracking: start from now.
+      try {
+        localStorage.setItem(SEEN_FLOOR_KEY, String(data.max_id || 0));
+        localStorage.removeItem(LEGACY_SEEN_KEY);
+      } catch (_) {}
+      _unread = [];
+    } else {
+      _unread = data.notes || [];
+    }
+    _indexUnread();
+    updateUnseenBadge();
+  } catch (_) {}
+}
+
 // ── Notes thread (append-only, attributed, 4s polling while modal open) ────
 let _notesPollTimer = null;
 let _currentNotes   = [];
+let _noteImages     = [];      // File objects staged for the next note post
+const _MAX_NOTE_IMAGES = 10;
 let _notesTouched   = false;   // note count changed while modal open → refresh line indicators on close
 let _checklistTouched = false; // setup checkboxes changed → refresh complete-state styling on close
+let _newAfterId     = Number.MAX_SAFE_INTEGER; // notes above this id get the "New" divider
+let _scrollToNew    = false;   // scroll the divider into view on the next render
+
+// The fixed reaction set (mirrors REACTION_EMOJIS in app.py)
+const REACTIONS = ['👍', '❤️', '😂', '😮', '🎉', '👀', '✅', '🙏'];
 
 async function loadNotes(eventId) {
   try {
@@ -78,6 +176,7 @@ async function loadNotes(eventId) {
     _currentNotes = await res.json();
     renderNotes(_currentNotes);
     syncNoteCount(eventId, _currentNotes.length);
+    markNotesSeen(eventId, _currentNotes);
   } catch (_) {}
 }
 
@@ -96,8 +195,12 @@ function syncNoteCount(id, count) {
 function renderNotes(notes) {
   const list = document.getElementById('notes-list');
   if (!list) return;
-  // Don't stomp on an inline edit that's in progress (e.g. a poll tick)
-  if (list.querySelector('.note-item.editing')) return;
+  // Don't stomp on an inline edit or an open reaction picker (e.g. a poll tick)
+  if (list.querySelector('.note-item.editing, .reaction-picker')) return;
+
+  const syncEl = document.getElementById('notes-sync');
+  if (syncEl) syncEl.textContent = notes.length
+    ? `${notes.length} comment${notes.length !== 1 ? 's' : ''}` : '';
 
   if (!notes.length) {
     list.innerHTML = '<div class="notes-empty text-muted small">No notes yet — add the first one below.</div>';
@@ -105,23 +208,76 @@ function renderNotes(notes) {
   }
 
   const me = getUsername();
+  const firstNew = notes.find(n => n.id > _newAfterId && n.author !== me);
   list.innerHTML = notes.map(n => {
     const mine  = !!me && n.author === me;
     const stamp = fmtNoteTime(n.created_at) + (n.updated_at ? ' · edited' : '');
-    const actions = mine ? `
+    const actions = `
         <span class="note-actions">
+          <button class="note-action reaction-add" title="Add reaction" onclick="App.toggleReactionPicker(${n.id})"><i class="bi bi-emoji-smile"></i></button>
+          ${mine ? `
           <button class="note-action" title="Edit" onclick="App.editNote(${n.id})"><i class="bi bi-pencil"></i></button>
-          <button class="note-action" title="Delete" onclick="App.deleteNote(${n.id})"><i class="bi bi-trash3"></i></button>
-        </span>` : '';
-    return `<div class="note-item${mine ? ' mine' : ''}" data-note-id="${n.id}">
+          <button class="note-action" title="Delete" onclick="App.deleteNote(${n.id})"><i class="bi bi-trash3"></i></button>` : ''}
+        </span>`;
+    const imgs = (n.images || []).length
+      ? `<div class="note-images">${n.images.map(fn => `
+           <a href="/note-images/${encodeURIComponent(fn)}" target="_blank" rel="noopener"
+              title="Open full-size photo">
+             <img class="note-image-thumb" src="/note-images/${encodeURIComponent(fn)}"
+                  alt="Photo attached by ${escHtml(n.author)}" loading="lazy">
+           </a>`).join('')}</div>`
+      : '';
+    const divider = n === firstNew
+      ? '<div class="notes-new-divider" id="notes-new-divider"><span>New</span></div>' : '';
+    return `${divider}<div class="note-item${mine ? ' mine' : ''}" data-note-id="${n.id}">
         <div class="note-head">
           <span class="note-author">${escHtml(n.author)}</span>
           <span class="note-time">${escHtml(stamp)}</span>
           ${actions}
         </div>
-        <div class="note-text">${escHtml(n.text).replace(/\n/g, '<br>')}</div>
+        ${n.text ? `<div class="note-text">${escHtml(n.text).replace(/\n/g, '<br>')}</div>` : ''}
+        ${imgs}
+        ${reactionChips(n, me)}
       </div>`;
   }).join('');
+
+  if (_scrollToNew) {
+    _scrollToNew = false;
+    const div = document.getElementById('notes-new-divider');
+    if (div) div.scrollIntoView({ block: 'center' });
+  }
+}
+
+// Existing reactions under a note: one chip per emoji with its count, tinted
+// when it includes yours; tapping a chip toggles your own reaction.
+function reactionChips(n, me) {
+  const rs = n.reactions || [];
+  if (!rs.length) return '';
+  return `<div class="note-reactions">${rs.map(r => {
+    const idx = REACTIONS.indexOf(r.emoji);
+    if (idx < 0) return '';
+    const mine = !!me && r.authors.includes(me);
+    return `<button type="button" class="reaction-chip${mine ? ' mine' : ''}"
+              title="${escHtml(r.authors.join(', '))}"
+              onclick="App.react(${n.id}, ${idx})">${r.emoji}<span>${r.authors.length}</span></button>`;
+  }).join('')}</div>`;
+}
+
+function closeReactionPicker() {
+  const picker = document.querySelector('.reaction-picker');
+  if (picker) picker.remove();
+}
+
+// Show staged (not-yet-posted) photo thumbnails with a remove button each.
+function renderNoteImagePreview() {
+  const box = document.getElementById('note-image-preview');
+  if (!box) return;
+  box.innerHTML = _noteImages.map((f, i) => `
+    <span class="note-image-chip">
+      <img src="${URL.createObjectURL(f)}" alt="${escHtml(f.name)}">
+      <button type="button" class="note-image-remove" title="Remove"
+              onclick="App.removeNoteImage(${i})">&times;</button>
+    </span>`).join('');
 }
 
 function startNotesPoll(eventId) {
@@ -150,14 +306,92 @@ let ALL_EVENTS = [];
 let _eventsById = {};
 let groupedMode = false;
 let showHidden  = false;   // reveal events that users have hidden
-let showPast    = false;   // reveal events whose group's last instance has passed
+// Past events are shown by default (greyed + badged, never auto-hidden). The
+// "past" detection currently mis-flags some events that haven't started yet
+// (suspected server-vs-venue timezone mismatch in group_past), so auto-hiding is
+// disabled until that's fixed — the toggle can still collapse them manually.
+let showPast    = true;    // reveal events whose group's last instance has passed
 const FILTERS = { depts: new Set(), q: '', cancelledOnly: false };
 let _searchTimer = null;   // debounce handle for the search box
+
+// ── Saved filters (per-browser) ───────────────────────────────────────────
+// Department chips, search text and the cancelled toggle survive a reload, so
+// e.g. Security staff land straight on their own events each visit.
+const FILTERS_KEY = 'hygd_filters';
+
+function saveFilters() {
+  const search = document.getElementById('event-search');
+  const saved = {
+    depts: [...FILTERS.depts],
+    q: search ? search.value : FILTERS.q,
+    cancelledOnly: FILTERS.cancelledOnly,
+  };
+  try { localStorage.setItem(FILTERS_KEY, JSON.stringify(saved)); } catch (_) {}
+}
+
+function loadFilters() {
+  let saved;
+  try { saved = JSON.parse(localStorage.getItem(FILTERS_KEY) || 'null'); } catch (_) { return; }
+  if (!saved || typeof saved !== 'object') return;
+  if (Array.isArray(saved.depts)) {
+    saved.depts.forEach(d => { if (typeof d === 'string') FILTERS.depts.add(d); });
+  }
+  if (typeof saved.q === 'string') {
+    FILTERS.q = saved.q.trim().toLowerCase();
+    const search = document.getElementById('event-search');
+    if (search) search.value = saved.q;
+  }
+  FILTERS.cancelledOnly = saved.cancelledOnly === true;
+}
+
+// ── Multi-select (bulk delete) ────────────────────────────────────────────
+// In select mode, clicking an event ticks it instead of opening it. The
+// selection survives date navigation, so you can gather events across days.
+let selectMode = false;
+const SELECTED = new Map();   // event id (string) → label used in the confirm
+
+function selectionLabel(raw) {
+  const d = parseLocalISO(raw.start);
+  const when = d ? d.toLocaleDateString('en-CA', { month: 'short', day: 'numeric' }) : '';
+  const room = raw.extendedProps.room ? ` · ${raw.extendedProps.room}` : '';
+  return `${raw.title}${when ? ` (${when}${room})` : ''}`;
+}
+
+function setSelected(id, on) {
+  id = String(id);
+  const raw = _eventsById[id];
+  if (on && raw) SELECTED.set(id, selectionLabel(raw));
+  else           SELECTED.delete(id);
+  document.querySelectorAll(`[data-event-id="${id}"]`)
+    .forEach(el => el.classList.toggle('event-selected', SELECTED.has(id)));
+}
+
+function updateSelectBar() {
+  const bar = document.getElementById('select-bar');
+  if (!bar) return;
+  bar.classList.toggle('d-none', !selectMode);
+  document.body.classList.toggle('selecting', selectMode);
+  document.getElementById('calendar-wrap').classList.toggle('select-mode', selectMode);
+  const btn = document.getElementById('select-btn');
+  if (btn) btn.classList.toggle('active', selectMode);
+
+  const n = SELECTED.size;
+  const shown = new Set(applyFilters(ALL_EVENTS).map(e => e.id));
+  const offscreen = [...SELECTED.keys()].filter(id => !shown.has(id)).length;
+  document.getElementById('select-count').textContent = n
+    ? `${n} selected${offscreen ? ` (${offscreen} not shown)` : ''}`
+    : 'Tap events to select them';
+  const del = document.getElementById('select-delete-btn');
+  del.disabled = n === 0;
+  del.querySelector('.select-delete-label').textContent =
+    n ? `Delete ${n}` : 'Delete';
+}
 
 // ── FullCalendar ──────────────────────────────────────────────────────────
 let calendar;
 
 document.addEventListener('DOMContentLoaded', () => {
+  loadFilters();   // before the first fetch, so it renders already filtered
   const el = document.getElementById('calendar');
 
   calendar = new FullCalendar.Calendar(el, {
@@ -186,6 +420,7 @@ document.addEventListener('DOMContentLoaded', () => {
       updateGroupedToolbar();
     },
     eventClick(info) {
+      if (selectMode) { App.toggleSelect(info.event.id); return; }
       showEventModal(info.event);
     },
     eventDidMount(info) {
@@ -212,6 +447,8 @@ document.addEventListener('DOMContentLoaded', () => {
       if (props.hidden) {
         info.el.classList.add('event-hidden');
       }
+      info.el.dataset.eventId = info.event.id;
+      if (SELECTED.has(String(info.event.id))) info.el.classList.add('event-selected');
       if (eventIsComplete(props)) info.el.classList.add('event-complete');
       if (eventIsPast(props)) info.el.classList.add('event-past');
       decorateEvent(info, isList);
@@ -229,6 +466,15 @@ document.addEventListener('DOMContentLoaded', () => {
   calendar.render();
   refreshBadge();
 
+  // Background refresh so a comment someone else adds shows up as a live
+  // notification (unseen badge / ★ flag) without needing a manual reload.
+  // Skipped while an event's notes are already open — that thread has its
+  // own 4s poll — and while the tab is in the background.
+  setInterval(() => {
+    if (document.hidden || _currentEventId != null) return;
+    calendar.refetchEvents();
+  }, 60000);
+
   // Swap the calendar toolbar for a compact one when crossing the mobile
   // breakpoint. Driven off window resize so it also fires on orientation change.
   let _wasMobile = isMobile();
@@ -242,12 +488,25 @@ document.addEventListener('DOMContentLoaded', () => {
   document.getElementById('eventModal').addEventListener('hide.bs.modal', () => {
     stopNotesPoll();
     _currentEventId = null;
+    _noteImages = [];          // discard any photos staged but not posted
     if (_notesTouched || _checklistTouched) {
       _notesTouched = false;
       _checklistTouched = false;
+      updateUnseenBadge();
       if (groupedMode) renderGrouped(applyFilters(ALL_EVENTS));
       else             calendar.refetchEvents();
     }
+  });
+
+  // Close the comment inbox / reaction picker when clicking anywhere else
+  document.addEventListener('click', (e) => {
+    if (inboxIsOpen() && !e.target.closest('#comment-inbox, #unseen-badge')) closeInbox();
+    if (!e.target.closest('.reaction-picker, .reaction-add')) closeReactionPicker();
+  });
+  document.addEventListener('keydown', (e) => {
+    if (e.key !== 'Escape') return;
+    if (inboxIsOpen()) closeInbox();
+    else if (selectMode && !document.querySelector('.modal.show')) App.toggleSelectMode();
   });
 
   // Ask for a display name once (used to attribute notes), show it in the header
@@ -316,12 +575,105 @@ function updatePastButton() {
     (showPast ? 'Showing past' : 'Show past') + (count ? ` (${count})` : '');
 }
 
+// Header pill: total unread comments across all events. Clicking it opens the
+// inbox, which lists them by event so you can jump straight to each thread.
+function updateUnseenBadge() {
+  const badge = document.getElementById('unseen-badge');
+  if (!badge) return;
+  const total  = _unread.length;
+  const events = Object.keys(_unreadByEvent).length;
+  badge.classList.toggle('d-none', total === 0);
+  if (total > 0) {
+    badge.innerHTML = `<i class="bi bi-chat-dots-fill me-1"></i>${total}<span class="unseen-label"> new comment${total !== 1 ? 's' : ''}</span>`;
+    badge.title = `${events} event${events !== 1 ? 's' : ''} with new comments — click to view`;
+  } else {
+    closeInbox();
+  }
+  if (inboxIsOpen()) renderInbox();
+}
+
+function inboxIsOpen() {
+  const box = document.getElementById('comment-inbox');
+  return !!box && !box.classList.contains('d-none');
+}
+
+function closeInbox() {
+  const box = document.getElementById('comment-inbox');
+  if (box) box.classList.add('d-none');
+  const badge = document.getElementById('unseen-badge');
+  if (badge) badge.setAttribute('aria-expanded', 'false');
+}
+
+// One row per event with unread comments, most recently active first.
+function renderInbox() {
+  const list = document.getElementById('comment-inbox-list');
+  if (!list) return;
+  const groups = [];
+  const byEvent = {};
+  for (const n of _unread) {           // _unread is newest first
+    const k = String(n.event_id);
+    if (!byEvent[k]) { byEvent[k] = { latest: n, count: 0 }; groups.push(byEvent[k]); }
+    byEvent[k].count++;
+  }
+  const count = document.getElementById('comment-inbox-count');
+  if (count) count.textContent = _unread.length;
+
+  list.innerHTML = groups.map(({ latest: n, count }) => {
+    const raw   = _eventsById[String(n.event_id)];
+    const title = n.event_name || `${n.room || ''} – ${n.service_type || ''}`;
+    const color = n.status === 'cancelled' ? '#9e9e9e'
+      : eventColor((raw && raw.extendedProps.group_key) || title);
+    const when  = fmtInboxDate(n.date, n.start_time);
+    const body  = n.text
+      ? escHtml(n.text.length > 140 ? n.text.slice(0, 140) + '…' : n.text)
+      : '<i class="bi bi-image me-1"></i>Photo';
+    const tags  = (n.status === 'cancelled' ? '<span class="inbox-tag">Cancelled</span>' : '')
+      + (n.hidden ? '<span class="inbox-tag"><i class="bi bi-eye-slash"></i> Hidden</span>' : '');
+    return `<button type="button" class="inbox-row" onclick="App.openFromInbox(${n.event_id})">
+        <span class="inbox-dot" style="background:${color}"></span>
+        <span class="inbox-main">
+          <span class="inbox-event">${escHtml(title)}${tags}</span>
+          <span class="inbox-when">${escHtml(when)}${n.room ? ` · ${escHtml(n.room)}` : ''}</span>
+          <span class="inbox-snippet"><strong>${escHtml(n.author)}:</strong> ${body}</span>
+          <span class="inbox-meta">${escHtml(fmtRelative(n.created_at))}${count > 1 ? ` · +${count - 1} more` : ''}</span>
+        </span>
+        <span class="inbox-count" title="${count} new">${count}</span>
+      </button>`;
+  }).join('');
+}
+
+// "2026-10-18", "14:00" → "Sat, Oct 18 · 14:00"
+function fmtInboxDate(date, time) {
+  if (!date) return '';
+  const d = new Date(date + 'T00:00:00');
+  const day = isNaN(d) ? date
+    : d.toLocaleDateString('en-CA', { weekday: 'short', month: 'short', day: 'numeric' });
+  return time ? `${day} · ${time}` : day;
+}
+
+// SQLite UTC timestamp → "just now" / "5m ago" / "3h ago" / "2d ago" / date
+function fmtRelative(ts) {
+  if (!ts) return '';
+  const d = new Date(ts.replace(' ', 'T') + 'Z');
+  if (isNaN(d)) return ts;
+  const mins = Math.round((Date.now() - d) / 60000);
+  if (mins < 1)  return 'just now';
+  if (mins < 60) return `${mins}m ago`;
+  const hrs = Math.round(mins / 60);
+  if (hrs < 24)  return `${hrs}h ago`;
+  const days = Math.round(hrs / 24);
+  if (days < 7)  return `${days}d ago`;
+  return fmtNoteTime(ts);
+}
+
 // ── Event fetching + filtering ────────────────────────────────────────────
 async function fetchEvents(info, success, failure) {
   try {
     const qs  = info.startStr && info.endStr
       ? `?start=${info.startStr}&end=${info.endStr}` : '';
-    const res = await fetch(`/api/events${qs}`);
+    // Unread comments are fetched alongside, so the comment chips drawn for
+    // these events reflect the latest state.
+    const [res] = await Promise.all([fetch(`/api/events${qs}`), refreshUnread()]);
     ALL_EVENTS = await res.json();
     _eventsById = {};
     for (const e of ALL_EVENTS) _eventsById[e.id] = e;
@@ -329,6 +681,8 @@ async function fetchEvents(info, success, failure) {
     buildLegend(ALL_EVENTS);
     updateHiddenButton();
     updatePastButton();
+    updateUnseenBadge();
+    if (selectMode) updateSelectBar();
     if (groupedMode) renderGrouped(applyFilters(ALL_EVENTS));
     success(applyFilters(ALL_EVENTS));
   } catch (err) {
@@ -359,6 +713,9 @@ function buildFilterBar(list) {
     const cat = e.extendedProps.dept_category || 'General';
     counts[cat] = (counts[cat] || 0) + 1;
   }
+  // A saved/active department with nothing in this range still gets a chip,
+  // so whatever is filtering the view stays visible and can be switched off.
+  for (const cat of FILTERS.depts) if (!(cat in counts)) counts[cat] = 0;
 
   const chipWrap = document.getElementById('dept-filters');
   const cats = Object.keys(counts).sort((a, b) => counts[b] - counts[a] || a.localeCompare(b));
@@ -395,8 +752,11 @@ function updateFilterMeta(total) {
   clear.classList.toggle('d-none', !active);
 }
 
-// An event is "complete" once every setup item has been checked off.
+// An event is "complete" when it's been explicitly marked done, OR (for events
+// that carry setup items) once every item has been checked off. The manual flag
+// is the only path for events with no tickable items.
 function eventIsComplete(p) {
+  if (p.manually_complete) return true;
   const total = (p.setup_items || []).length;
   if (!total) return false;
   const checked = (p.checked_items || []).filter(i => i < total).length;
@@ -421,6 +781,12 @@ function decorateEvent(info, isList) {
                || info.el.querySelector('.fc-event-title');
   if (!titleEl) return;
 
+  if (!titleEl.querySelector('.sel-box')) {
+    const s = document.createElement('span');
+    s.className = 'sel-box';
+    s.innerHTML = '<i class="bi bi-square"></i><i class="bi bi-check-square-fill"></i>';
+    titleEl.prepend(s);
+  }
   // Event number — leading badge, mirrors how it reads on the source PDF (#191346 …)
   if (p.event_number && !titleEl.querySelector('.ev-number')) {
     const s = document.createElement('span');
@@ -447,10 +813,13 @@ function decorateEvent(info, isList) {
     titleEl.appendChild(s);
   }
   if (p.note_count > 0 && !titleEl.querySelector('.note-flag')) {
+    const unseen = unseenNoteCount(info.event.id);
     const s = document.createElement('span');
-    s.className = 'note-flag';
-    s.textContent = '★';
-    s.title = `${p.note_count} note${p.note_count !== 1 ? 's' : ''}`;
+    s.className = 'note-flag' + (unseen > 0 ? ' has-unseen' : '');
+    s.innerHTML = `<i class="bi bi-chat-dots-fill"></i> ${p.note_count}`;
+    s.title = unseen > 0
+      ? `${p.note_count} comment${p.note_count !== 1 ? 's' : ''} — ${unseen} new`
+      : `${p.note_count} comment${p.note_count !== 1 ? 's' : ''}`;
     titleEl.appendChild(s);
   }
   if (p.hidden && !titleEl.querySelector('.hidden-flag')) {
@@ -536,6 +905,14 @@ function withinCurrentPeriod(list) {
   });
 }
 
+// A group's display name: the event title plus its booking number, so two
+// bookings with the same name (e.g. weekly "HIVE Social") can be told apart.
+function groupLabel(e, key) {
+  const title = (e && e.title) || '';
+  if (!key || !key.startsWith('#')) return title || key;
+  return title && title !== key ? `${title} · ${key}` : key;
+}
+
 function renderGrouped(list) {
   const panel = document.getElementById('grouped-panel');
 
@@ -557,7 +934,7 @@ function renderGrouped(list) {
     const dates  = [...new Set(evs.map(e => (e.start || '').slice(0, 10)).filter(Boolean))].sort();
     return {
       key,
-      name:   evs.find(e => e.title)?.title || key,
+      name:   groupLabel(evs.find(e => e.title) || evs[0], key),
       color:  eventColor(key),
       events: evs,
       rooms:  new Set(evs.map(e => e.extendedProps.room).filter(Boolean)).size,
@@ -588,8 +965,9 @@ function renderGrouped(list) {
       const deptTag = p.dept_category && p.dept_category !== 'General'
         ? `<span class="dept-tag">${escHtml(p.dept_category)}</span>` : '';
       const flag = p.layout_image ? '<span class="ev-flag" title="Room layout available">🗺</span>' : '';
+      const unseen = unseenNoteCount(e.id);
       const noteFlag = p.note_count > 0
-        ? `<span class="note-flag" title="${p.note_count} note${p.note_count !== 1 ? 's' : ''}">★</span>` : '';
+        ? `<span class="note-flag${unseen > 0 ? ' has-unseen' : ''}" title="${p.note_count} comment${p.note_count !== 1 ? 's' : ''}${unseen > 0 ? ` — ${unseen} new` : ''}"><i class="bi bi-chat-dots-fill"></i> ${p.note_count}</span>` : '';
       const hiddenFlag = p.hidden
         ? '<span class="hidden-flag" title="Hidden event"><i class="bi bi-eye-slash"></i></span>' : '';
       const complete = eventIsComplete(p);
@@ -597,7 +975,10 @@ function renderGrouped(list) {
       const completeBadge = complete
         ? '<span class="status-badge complete"><i class="bi bi-check-circle-fill me-1"></i>Complete</span>' : '';
       const pastBadge = past ? '<span class="status-badge past">Past</span>' : '';
-      return `<button class="group-row${cancelled ? ' cancelled' : ''}${p.hidden ? ' hidden' : ''}${complete ? ' complete' : ''}${past ? ' past' : ''}" onclick="App.openEvent('${e.id}')">
+      const selected = SELECTED.has(String(e.id));
+      return `<button class="group-row${cancelled ? ' cancelled' : ''}${p.hidden ? ' hidden' : ''}${complete ? ' complete' : ''}${past ? ' past' : ''}${selected ? ' event-selected' : ''}"
+                data-event-id="${e.id}" onclick="App.rowClick('${e.id}')">
+          <span class="sel-box"><i class="bi bi-square"></i><i class="bi bi-check-square-fill"></i></span>
           <span class="group-row-time">${escHtml(fmtTimeISO(e.start))}${e.end ? '–' + escHtml(fmtTimeISO(e.end)) : ''}</span>
           <span class="group-row-room">${escHtml(p.room || '—')}</span>
           <span class="group-row-fn">${escHtml(p.service_type || e.title)}${flag}${noteFlag}${hiddenFlag}${deptTag}${completeBadge}${pastBadge}</span>
@@ -614,6 +995,13 @@ function renderGrouped(list) {
             <i class="bi bi-eye${allHidden ? '' : '-slash'} me-1"></i>${allHidden ? 'Unhide all' : 'Hide all'}
           </button>`;
 
+    // Select / deselect the whole booking (select mode only)
+    const allSelected = g.events.every(e => SELECTED.has(String(e.id)));
+    const selectGroupBtn = `<button class="group-select-btn${allSelected ? ' on' : ''}" data-ids="${groupIds}"
+            onclick="event.preventDefault();event.stopPropagation();App.selectGroup(this)">
+            <i class="bi ${allSelected ? 'bi-check-square-fill' : 'bi-square'} me-1"></i>${allSelected ? 'Deselect group' : 'Select group'}
+          </button>`;
+
     return `<details class="group-card${allHidden ? ' all-hidden' : ''}" open>
         <summary class="group-summary">
           <span class="group-dot" style="background:${g.color}"></span>
@@ -626,6 +1014,7 @@ function renderGrouped(list) {
             ${g.layouts ? '· 🗺 ' + g.layouts : ''}
             ${g.contact ? '· ' + escHtml(g.contact) : ''}
           </span>
+          ${selectGroupBtn}
           ${hideGroupBtn}
         </summary>
         <div class="group-rows">${rows}</div>
@@ -711,6 +1100,27 @@ function showEventModal(event) {
        </div>`
     : '';
 
+  // Explicit "mark complete" control. Always shown — it's the only way to
+  // complete an event that has no tickable items, and an override for one where
+  // some items don't apply. When all items are already ticked the event is
+  // complete regardless; the toggle then just reflects that state.
+  const manualComplete = !!props.manually_complete;
+  // The "manual override" hint only makes sense when there ARE items and they
+  // aren't all ticked. For a no-item event the toggle is the normal path, so no
+  // hint is shown.
+  const showHint = manualComplete && items.length > 0 && !setupComplete;
+  const completeHtml = `
+    <div class="complete-section mb-3">
+      <label class="complete-toggle${manualComplete ? ' on' : ''}">
+        <input type="checkbox" id="mark-complete" ${manualComplete ? 'checked' : ''}>
+        <i class="bi ${manualComplete ? 'bi-check-circle-fill' : 'bi-circle'} me-2"></i>
+        <span>${manualComplete ? 'Marked complete' : 'Mark this event complete'}</span>
+      </label>
+      <p class="complete-hint${showHint ? '' : ' d-none'}" id="complete-hint">
+        <i class="bi bi-info-circle me-1"></i>Completed manually — not every item is ticked.
+      </p>
+    </div>`;
+
   // Notes — append-only, attributed thread. Everyone adds their own entry, so
   // simultaneous editors never overwrite each other. Rendered by loadNotes().
   const assistHtml = `
@@ -722,9 +1132,18 @@ function showEventModal(event) {
       <div class="notes-add mt-2">
         <textarea id="note-input" class="form-control" rows="2"
                   placeholder="Add a note as ${escHtml(getUsername() || 'you')}…"></textarea>
-        <button class="btn btn-primary btn-sm mt-2" id="note-add-btn" onclick="App.postNote()">
-          <i class="bi bi-send me-1"></i>Add note
-        </button>
+        <div class="note-image-preview" id="note-image-preview"></div>
+        <input type="file" id="note-image-input" accept="image/*" multiple hidden
+               onchange="App.onNoteImagesPicked()">
+        <div class="notes-add-actions mt-2">
+          <button class="btn btn-outline-secondary btn-sm" id="note-photo-btn"
+                  onclick="document.getElementById('note-image-input').click()">
+            <i class="bi bi-image me-1"></i>Add photo
+          </button>
+          <button class="btn btn-primary btn-sm" id="note-add-btn" onclick="App.postNote()">
+            <i class="bi bi-send me-1"></i>Add note
+          </button>
+        </div>
       </div>
     </div>`;
 
@@ -815,6 +1234,7 @@ function showEventModal(event) {
     <hr>
     ${layoutHtml}
     ${setupHtml}
+    ${completeHtml}
     ${notesHtml}
     ${assistHtml}
     ${sourceHtml}
@@ -829,6 +1249,9 @@ function showEventModal(event) {
   }
 
   wireProgressControls(event.id);
+  closeReactionPicker();
+  _newAfterId  = lastSeenNoteId(String(event.id));
+  _scrollToNew = unseenNoteCount(event.id) > 0;
   loadNotes(event.id);
   startNotesPoll(event.id);
   bootstrap.Modal.getOrCreateInstance(document.getElementById('eventModal')).show();
@@ -844,6 +1267,39 @@ function wireProgressControls(id) {
       saveProgress(id);
     });
   });
+
+  const mark = document.getElementById('mark-complete');
+  if (mark) mark.addEventListener('change', () => saveManualComplete(id, mark.checked));
+}
+
+async function saveManualComplete(id, complete) {
+  const body = document.getElementById('event-modal-body');
+
+  // Reflect the new state in the toggle's label/icon and the manual hint.
+  const toggle = body.querySelector('.complete-toggle');
+  if (toggle) {
+    toggle.classList.toggle('on', complete);
+    const icon = toggle.querySelector('i.bi');
+    if (icon) icon.className = `bi ${complete ? 'bi-check-circle-fill' : 'bi-circle'} me-2`;
+    const txt = toggle.querySelector('span');
+    if (txt) txt.textContent = complete ? 'Marked complete' : 'Mark this event complete';
+  }
+  const hint  = document.getElementById('complete-hint');
+  const total = body.querySelectorAll('.item-check').length;
+  const done  = body.querySelectorAll('.item-check:checked').length;
+  if (hint) hint.classList.toggle('d-none', !(complete && total > 0 && done < total));
+
+  updateManualCompleteCache(id, complete);   // optimistic
+  _checklistTouched = true;                   // refresh line styling on close
+
+  try {
+    const res = await fetch(`/api/events/${id}/progress`, {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ manually_complete: complete }),
+    });
+    if (!res.ok) throw new Error('save failed');
+  } catch (_) {}
 }
 
 async function saveProgress(id) {
@@ -855,6 +1311,14 @@ async function saveProgress(id) {
   if (prog) {
     prog.textContent = progressLabel(checked.length, total);
     prog.classList.toggle('complete', total > 0 && checked.length >= total);
+  }
+
+  // Keep the "completed manually" hint accurate as items are ticked/unticked.
+  const mark = document.getElementById('mark-complete');
+  const hint = document.getElementById('complete-hint');
+  if (hint) {
+    const overriding = mark && mark.checked && total > 0 && checked.length < total;
+    hint.classList.toggle('d-none', !overriding);
   }
 
   updateProgressCache(id, checked);   // optimistic — keeps this session in sync
@@ -876,6 +1340,14 @@ function updateProgressCache(id, checked) {
   if (raw) raw.extendedProps.checked_items = checked;
   const fcEv = calendar.getEventById(String(id));
   if (fcEv) fcEv.setExtendedProp('checked_items', checked);
+}
+
+// Mirror the manual "mark complete" flag into the in-memory caches
+function updateManualCompleteCache(id, complete) {
+  const raw = _eventsById[id];
+  if (raw) raw.extendedProps.manually_complete = complete;
+  const fcEv = calendar.getEventById(String(id));
+  if (fcEv) fcEv.setExtendedProp('manually_complete', complete);
 }
 
 // ── Upload ────────────────────────────────────────────────────────────────
@@ -931,6 +1403,26 @@ async function doUpload(file) {
 
   try {
     const res  = await fetch('/upload', { method: 'POST', body: formData });
+
+    // A server/proxy error (413, 502, 504…) often returns an HTML page, not
+    // JSON, so check the status before parsing — otherwise res.json() throws a
+    // cryptic "unexpected character" error that hides the real cause. When the
+    // app itself returns a JSON error (e.g. a 500 "Parsing failed: …"), surface
+    // that specific message rather than a generic one.
+    if (!res.ok) {
+      let serverMsg = '';
+      try { serverMsg = (JSON.parse(await res.text()) || {}).error || ''; } catch (_) {}
+      const msg = serverMsg
+        ? serverMsg
+        : res.status === 413
+        ? 'This file is too large for the server to accept. Ask an admin to raise the upload size limit (nginx client_max_body_size).'
+        : (res.status === 502 || res.status === 504)
+        ? 'The server timed out processing this report — it may be very large. Ask an admin to raise the request timeout (gunicorn --timeout / nginx proxy_read_timeout).'
+        : `Server error (${res.status}). Please try again, or contact an admin if it persists.`;
+      alert.innerHTML = errorAlert(msg);
+      return;
+    }
+
     const data = await res.json();
 
     if (data.error) {
@@ -980,11 +1472,13 @@ const App = {
   toggleDept(cat) {
     if (FILTERS.depts.has(cat)) FILTERS.depts.delete(cat);
     else                        FILTERS.depts.add(cat);
+    saveFilters();
     calendar.refetchEvents();
   },
 
   setSearch(text) {
     FILTERS.q = (text || '').trim().toLowerCase();
+    saveFilters();
     // Debounce so we don't re-render on every keystroke
     clearTimeout(_searchTimer);
     _searchTimer = setTimeout(() => {
@@ -995,6 +1489,7 @@ const App = {
 
   toggleCancelled() {
     FILTERS.cancelledOnly = !FILTERS.cancelledOnly;
+    saveFilters();
     calendar.refetchEvents();
   },
 
@@ -1004,6 +1499,7 @@ const App = {
     FILTERS.cancelledOnly = false;
     const search = document.getElementById('event-search');
     if (search) search.value = '';
+    saveFilters();
     calendar.refetchEvents();
   },
 
@@ -1086,6 +1582,120 @@ const App = {
     if (raw) openEventRaw(raw);
   },
 
+  // ── Multi-select / bulk delete ───────────────────────────────────────
+  toggleSelectMode() {
+    selectMode = !selectMode;
+    if (!selectMode) SELECTED.clear();
+    document.querySelectorAll('.event-selected').forEach(el => el.classList.remove('event-selected'));
+    updateSelectBar();
+    if (groupedMode) renderGrouped(applyFilters(ALL_EVENTS));
+  },
+
+  toggleSelect(id) {
+    setSelected(id, !SELECTED.has(String(id)));
+    updateSelectBar();
+    if (groupedMode) renderGrouped(applyFilters(ALL_EVENTS));
+  },
+
+  // Grouped-view row: tick it in select mode, otherwise open it
+  rowClick(id) {
+    if (selectMode) App.toggleSelect(id);
+    else            App.openEvent(id);
+  },
+
+  selectGroup(btn) {
+    const ids = (btn.dataset.ids || '').split(',').filter(Boolean);
+    const allOn = ids.every(id => SELECTED.has(id));
+    ids.forEach(id => setSelected(id, !allOn));
+    updateSelectBar();
+    renderGrouped(applyFilters(ALL_EVENTS));
+  },
+
+  selectAllShown() {
+    applyFilters(ALL_EVENTS).forEach(e => setSelected(e.id, true));
+    updateSelectBar();
+    if (groupedMode) renderGrouped(applyFilters(ALL_EVENTS));
+  },
+
+  clearSelection() {
+    [...SELECTED.keys()].forEach(id => setSelected(id, false));
+    updateSelectBar();
+    if (groupedMode) renderGrouped(applyFilters(ALL_EVENTS));
+  },
+
+  async deleteSelected() {
+    const n = SELECTED.size;
+    if (!n) return;
+    const labels = [...SELECTED.values()];
+    const list = labels.slice(0, 8).map(l => `• ${l}`).join('\n')
+      + (labels.length > 8 ? `\n…and ${labels.length - 8} more` : '');
+    if (!confirm(`Delete ${n} event${n !== 1 ? 's' : ''}?\n\n${list}\n\n`
+        + 'Their comments and photos will be deleted too. This cannot be undone.')) return;
+
+    const btn = document.getElementById('select-delete-btn');
+    btn.disabled = true;
+    try {
+      const res = await fetch('/api/events/delete', {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({ ids: [...SELECTED.keys()].map(Number) }),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        alert(err.error || 'Could not delete the selected events.');
+        return;
+      }
+      SELECTED.clear();
+      App.toggleSelectMode();
+      calendar.refetchEvents();
+      refreshBadge();
+    } finally {
+      updateSelectBar();
+    }
+  },
+
+  // ── Comment inbox ────────────────────────────────────────────────────
+  toggleInbox() {
+    if (inboxIsOpen()) { closeInbox(); return; }
+    renderInbox();
+    const box = document.getElementById('comment-inbox');
+    // On phones it's a full-width sheet pinned just under the (wrapping) header
+    box.style.top = isMobile()
+      ? `${document.querySelector('.app-header').getBoundingClientRect().bottom + 6}px` : '';
+    box.classList.remove('d-none');
+    document.getElementById('unseen-badge').setAttribute('aria-expanded', 'true');
+  },
+
+  // Open an event's thread from the inbox. Events outside the calendar's
+  // loaded range are fetched by their date first.
+  async openFromInbox(eventId) {
+    closeInbox();
+    let raw = _eventsById[String(eventId)];
+    if (!raw) {
+      const note = _unread.find(n => n.event_id === eventId);
+      if (!note) return;
+      try {
+        const res = await fetch(`/api/events?start=${note.date}&end=${note.date}`);
+        raw = (await res.json()).find(e => e.id === String(eventId));
+      } catch (_) {}
+    }
+    if (raw) openEventRaw(raw);
+  },
+
+  markAllRead() {
+    const map = _seenIdMap();
+    for (const n of _unread) {
+      const k = String(n.event_id);
+      map[k] = Math.max(map[k] || 0, n.id);
+    }
+    _saveSeenIdMap(map);
+    _unread = [];
+    _indexUnread();
+    updateUnseenBadge();
+    if (groupedMode) renderGrouped(applyFilters(ALL_EVENTS));
+    else             calendar.refetchEvents();
+  },
+
   openClear() {
     // Reset inputs and feedback
     document.getElementById('clear-start').value = '';
@@ -1138,23 +1748,55 @@ const App = {
     }
   },
 
+  // Stage newly picked photos (appended, deduped by name+size, capped) and show
+  // previews. Clears the input so picking the same file again still fires change.
+  onNoteImagesPicked() {
+    const input = document.getElementById('note-image-input');
+    if (!input) return;
+    for (const f of input.files) {
+      if (_noteImages.length >= _MAX_NOTE_IMAGES) break;
+      if (_noteImages.some(g => g.name === f.name && g.size === f.size)) continue;
+      _noteImages.push(f);
+    }
+    input.value = '';
+    renderNoteImagePreview();
+  },
+
+  removeNoteImage(idx) {
+    _noteImages.splice(idx, 1);
+    renderNoteImagePreview();
+  },
+
   async postNote() {
     let name = getUsername();
     if (!name) { App.changeName(); name = getUsername(); if (!name) return; }
     const input = document.getElementById('note-input');
     const text  = (input.value || '').trim();
-    if (!text || _currentEventId == null) return;
+    if ((!text && !_noteImages.length) || _currentEventId == null) return;
 
     const btn = document.getElementById('note-add-btn');
     if (btn) btn.disabled = true;
     try {
-      const res = await fetch(`/api/events/${_currentEventId}/notes`, {
-        method:  'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body:    JSON.stringify({ author: name, text }),
-      });
+      let opts;
+      if (_noteImages.length) {
+        // Photos require multipart/form-data — let the browser set the boundary.
+        const fd = new FormData();
+        fd.append('author', name);
+        fd.append('text', text);
+        for (const f of _noteImages) fd.append('images', f);
+        opts = { method: 'POST', body: fd };
+      } else {
+        opts = {
+          method:  'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body:    JSON.stringify({ author: name, text }),
+        };
+      }
+      const res = await fetch(`/api/events/${_currentEventId}/notes`, opts);
       if (res.ok) {
         input.value = '';
+        _noteImages = [];
+        renderNoteImagePreview();
         await loadNotes(_currentEventId);
       }
     } finally {
@@ -1204,6 +1846,39 @@ const App = {
     renderNotes(_currentNotes);
   },
 
+  // Small emoji picker anchored to a note's smiley button.
+  toggleReactionPicker(noteId) {
+    const open = document.querySelector('.reaction-picker');
+    const wasThisNote = open && open.dataset.noteId === String(noteId);
+    closeReactionPicker();
+    if (wasThisNote) return;
+    const head = document.querySelector(`.note-item[data-note-id="${noteId}"] .note-head`);
+    if (!head) return;
+    const picker = document.createElement('div');
+    picker.className = 'reaction-picker';
+    picker.dataset.noteId = noteId;
+    picker.innerHTML = REACTIONS.map((emo, i) =>
+      `<button type="button" onclick="App.react(${noteId}, ${i})">${emo}</button>`).join('');
+    head.appendChild(picker);
+  },
+
+  async react(noteId, idx) {
+    let name = getUsername();
+    if (!name) { App.changeName(); name = getUsername(); if (!name) return; }
+    const emoji = REACTIONS[idx];
+    if (!emoji) return;
+    closeReactionPicker();
+    const res = await fetch(`/api/notes/${noteId}/reactions`, {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ author: name, emoji }),
+    });
+    if (!res.ok) return;
+    const note = _currentNotes.find(n => n.id === noteId);
+    if (note) note.reactions = await res.json();
+    renderNotes(_currentNotes);
+  },
+
   async deleteNote(id) {
     if (!confirm('Delete your note? This cannot be undone.')) return;
     const res = await fetch(`/api/notes/${id}`, {
@@ -1225,7 +1900,7 @@ function buildLegend(fcEvents) {
     const key   = ev.extendedProps.group_key || ev.title;
     const label = ev.extendedProps.group_key
       ? (ev.title !== `${ev.extendedProps.room} – ${ev.extendedProps.service_type}`
-          ? ev.title : key)
+          ? groupLabel(ev, key) : key)
       : key;
     if (!groups[key]) {
       groups[key] = { label, color: eventColor(key), count: 0 };
