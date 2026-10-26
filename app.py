@@ -5,23 +5,28 @@ Start locally:   python app.py
 Production:      gunicorn -w 2 -b 0.0.0.0:5000 app:app
 """
 
+import csv
+import io
 import os
 import re
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 from dotenv import load_dotenv
-from flask import Flask, jsonify, render_template, request, send_from_directory
+from flask import (Flask, Response, jsonify, render_template, request,
+                   send_from_directory)
 
 load_dotenv()
 
 from analytics import build_analytics
 from analytics import dept_category as _dept_category
 from database import (add_note, count_events_in_range, delete_all_events,
-                      delete_event, delete_events_in_range, delete_note,
-                      get_event_by_id, get_events, get_notes, get_stats,
-                      init_db, save_events, set_event_hidden,
-                      set_events_hidden, set_event_progress, update_note)
+                      delete_event, delete_events, delete_events_in_range,
+                      delete_note, get_comments_report, get_event_by_id, get_events,
+                      get_notes,
+                      get_stats, get_unread_notes, init_db, save_events,
+                      set_event_hidden, set_events_hidden, set_event_progress,
+                      toggle_reaction, update_note)
 from parser import extract_and_parse_pdf
 
 app = Flask(__name__)
@@ -49,6 +54,87 @@ def index():
 @app.route("/analytics")
 def analytics_page():
     return render_template("analytics.html")
+
+
+@app.route("/comments/report")
+def comments_report():
+    """Every comment with its event's details — a printable page, or a CSV
+    download with ?format=csv. ?start/&end (YYYY-MM-DD) limit by event date."""
+    start = (request.args.get("start") or "").strip()[:10] or None
+    end = (request.args.get("end") or "").strip()[:10] or None
+    events = get_comments_report(start, end)
+    for ev in events:
+        ev["dept_category"] = _dept_category(ev.get("department", ""),
+                                             ev.get("service_type", ""))
+        for c in ev["comments"]:
+            c["when"] = _venue_time(c.get("created_at"))
+            c["edited"] = _venue_time(c.get("updated_at")) if c.get("updated_at") else ""
+
+    if request.args.get("format") == "csv":
+        return _comments_csv(events, start, end)
+
+    comments = [c for ev in events for c in ev["comments"]]
+    return render_template(
+        "comments_report.html",
+        events=events, start=start or "", end=end or "",
+        total_comments=len(comments),
+        authors=sorted({c["author"] for c in comments if c.get("author")}),
+        generated=datetime.now(_venue_tz()).strftime("%Y-%m-%d %H:%M"),
+    )
+
+
+def _comments_csv(events: list, start, end) -> Response:
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["Event date", "Start", "End", "Room", "Event", "Event #",
+                "Department", "Onsite contact", "MECS contact", "Attendance",
+                "Status", "Comment by", "Commented at", "Edited at",
+                "Comment", "Images", "Reactions"])
+    for ev in events:
+        for c in ev["comments"]:
+            reactions = " ".join(f"{r['emoji']}×{len(r['authors'])}"
+                                 for r in c.get("reactions", []))
+            w.writerow([_csv_safe(v) for v in (
+                ev["date"], ev["start_time"], ev["end_time"], ev["room"],
+                ev["event_name"], ev["event_number"], ev["dept_category"],
+                ev["onsite_contact"], ev["mecs_contact"], ev["attendance"],
+                ev["status"], c["author"], c["when"], c["edited"], c["text"],
+                len(c.get("images") or []), reactions,
+            )])
+    span = f"{start or 'all'}_to_{end or 'all'}" if (start or end) else "all"
+    # BOM so Excel opens the UTF-8 (accents, emoji) correctly.
+    return Response(
+        "﻿" + buf.getvalue(), mimetype="text/csv",
+        headers={"Content-Disposition":
+                 f'attachment; filename="hygd-comments-{span}.csv"'},
+    )
+
+
+def _csv_safe(v):
+    """Stop spreadsheet apps from running a cell that starts like a formula."""
+    v = "" if v is None else str(v)
+    return "'" + v if v[:1] in ("=", "+", "-", "@") else v
+
+
+def _venue_tz():
+    """The venue's timezone. Falls back to a fixed UTC−7 (BC's year-round
+    offset) when no tz database is installed (e.g. Windows without `tzdata`)."""
+    try:
+        from zoneinfo import ZoneInfo
+        return ZoneInfo(os.environ.get("VENUE_TZ", "America/Vancouver"))
+    except Exception:
+        return timezone(timedelta(hours=-7))
+
+
+def _venue_time(ts) -> str:
+    """SQLite UTC 'YYYY-MM-DD HH:MM:SS' → venue-local 'YYYY-MM-DD HH:MM'."""
+    if not ts:
+        return ""
+    try:
+        dt = datetime.strptime(str(ts)[:19], "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return str(ts)
+    return dt.replace(tzinfo=timezone.utc).astimezone(_venue_tz()).strftime("%Y-%m-%d %H:%M")
 
 
 @app.route("/layouts/<path:filename>")
@@ -301,6 +387,49 @@ def api_delete_note(note_id):
     return jsonify({"success": True})
 
 
+# The fixed set of reactions offered under each note.
+REACTION_EMOJIS = ["👍", "❤️", "😂", "😮", "🎉", "👀", "✅", "🙏"]
+
+
+@app.route("/api/notes/<int:note_id>/reactions", methods=["POST"])
+def api_toggle_reaction(note_id):
+    """Toggle the caller's emoji reaction on a note; returns its reactions."""
+    data   = request.get_json(silent=True) or {}
+    author = _author(data)
+    emoji  = str(data.get("emoji", ""))
+    if not author:
+        return jsonify({"error": "author required"}), 400
+    if emoji not in REACTION_EMOJIS:
+        return jsonify({"error": "unsupported reaction"}), 400
+    reactions = toggle_reaction(note_id, author, emoji)
+    if reactions is None:
+        return jsonify({"error": "note not found"}), 404
+    return jsonify(reactions)
+
+
+@app.route("/api/comments/unread", methods=["POST"])
+def api_unread_comments():
+    """New comments for the header inbox, across all events (not just the
+    calendar's visible range). The browser says what it has already seen:
+    `seen` maps event id → last-seen note id, `floor` covers events it has
+    never opened, and `me` excludes the caller's own comments."""
+    data = request.get_json(silent=True) or {}
+    seen = {}
+    raw_seen = data.get("seen")
+    if isinstance(raw_seen, dict):
+        for k, v in raw_seen.items():
+            try:
+                seen[str(int(k))] = int(v)
+            except (TypeError, ValueError):
+                pass
+    try:
+        floor = max(0, int(data.get("floor") or 0))
+    except (TypeError, ValueError):
+        floor = 0
+    me = str(data.get("me", "")).strip()[:_MAX_AUTHOR]
+    return jsonify(get_unread_notes(seen, floor, me))
+
+
 @app.route("/api/events/<int:event_id>/hidden", methods=["POST"])
 def api_event_hidden(event_id):
     """Hide or unhide an event for all users."""
@@ -325,6 +454,23 @@ def api_events_hidden_bulk():
         return jsonify({"error": "ids must be integers"}), 400
     n = set_events_hidden(ids, hidden)
     return jsonify({"success": True, "hidden": hidden, "updated": n})
+
+
+@app.route("/api/events/delete", methods=["POST"])
+def api_delete_events_bulk():
+    """Delete several selected events (and their comments) at once."""
+    data = request.get_json(silent=True) or {}
+    ids  = data.get("ids")
+    if not isinstance(ids, list) or not ids:
+        return jsonify({"error": "ids (non-empty list) required"}), 400
+    try:
+        ids = sorted({int(i) for i in ids})
+    except (ValueError, TypeError):
+        return jsonify({"error": "ids must be integers"}), 400
+    count, images = delete_events(ids)
+    _delete_note_images(images)
+    return jsonify({"success": True, "deleted": count,
+                    "message": f"Deleted {count} event{'s' if count != 1 else ''}"})
 
 
 @app.route("/api/events/clear", methods=["POST"])
@@ -368,18 +514,24 @@ def _group_key(e: dict) -> str:
     """
     Stable colour-grouping key for an event.
     Priority:
-      1. event_name  — groups all rooms of the same named event
-      2. booking #   — extracted from onsite_contact e.g. "Devan #189848"
-      3. room + date — unique fallback so unnamed/numberless events still render
+      1. event_number — one group per booking, so separate bookings that share
+                        a (possibly truncated) name stay apart
+      2. booking #    — extracted from onsite_contact e.g. "Devan #189848"
+      3. event_name   — groups all rooms of the same named event
+      4. room + date  — unique fallback so unnamed/numberless events still render
     """
-    name = (e.get("event_name") or "").strip()
-    if name:
-        return name
+    number = (e.get("event_number") or "").strip().lstrip("#")
+    if number:
+        return f"#{number}"
 
     contact = (e.get("onsite_contact") or "").strip()
     m = re.search(r"#(\d+)", contact)
     if m:
         return f"#{m.group(1)}"
+
+    name = (e.get("event_name") or "").strip()
+    if name:
+        return name
 
     return f"{e.get('room', 'unknown')}|{e.get('date', '')}"
 
@@ -398,10 +550,16 @@ def _event_end_dt(e: dict):
     date = (e.get("date") or "")[:10]
     if not date:
         return None
-    t = e.get("end_time") or e.get("start_time") or ""
+    start_t = e.get("start_time") or ""
+    t = e.get("end_time") or start_t
     try:
         if t and ":" in t:
-            return datetime.strptime(f"{date} {t[:5]}", "%Y-%m-%d %H:%M")
+            end = datetime.strptime(f"{date} {t[:5]}", "%Y-%m-%d %H:%M")
+            # An end earlier than the start (e.g. 22:00–01:00) runs past
+            # midnight, so it ends on the following day.
+            if start_t and ":" in start_t and t[:5] < start_t[:5]:
+                end += timedelta(days=1)
+            return end
         return datetime.strptime(f"{date} 23:59", "%Y-%m-%d %H:%M")
     except ValueError:
         return None

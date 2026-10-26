@@ -31,8 +31,20 @@
   <div class="d-flex align-items-center gap-2 header-actions">
     <span id="identity" class="header-identity"></span>
     <span id="event-count-badge" class="badge bg-secondary fs-6 px-3 py-2">0 events</span>
-    <span id="unseen-badge" class="badge bg-warning text-dark fs-6 px-3 py-2 d-none"
-          title="Events with new comments"></span>
+    <div class="inbox-wrap">
+      <button type="button" id="unseen-badge" class="badge bg-warning text-dark fs-6 px-3 py-2 border-0 d-none"
+              title="Events with new comments" aria-haspopup="true" aria-expanded="false"
+              onclick="App.toggleInbox()"></button>
+      <div id="comment-inbox" class="comment-inbox d-none" role="dialog" aria-label="New comments">
+        <div class="inbox-head">
+          <span class="inbox-title">New comments <span id="comment-inbox-count" class="inbox-total"></span></span>
+          <button type="button" class="btn btn-link btn-sm inbox-mark-all" onclick="App.markAllRead()">
+            <i class="bi bi-check2-all me-1"></i>Mark all read
+          </button>
+        </div>
+        <div id="comment-inbox-list" class="inbox-list"></div>
+      </div>
+    </div>
     <button class="btn btn-outline-light" onclick="App.toggleGrouped()" id="grouped-btn"
             title="Group events by client booking">
       <i class="bi bi-diagram-3 me-1"></i><span class="btn-label">Grouped</span>
@@ -49,6 +61,9 @@
             title="Show events whose last instance has already passed">
       <i class="bi bi-clock-history me-1"></i><span class="btn-label">Show past</span>
     </button>
+    <a class="btn btn-outline-light" href="/comments/report" title="Report of every comment, with event details — print or export to CSV">
+      <i class="bi bi-chat-square-text me-1"></i><span class="btn-label">Comments</span>
+    </a>
     <a class="btn btn-outline-light" href="/analytics" title="View event analytics">
       <i class="bi bi-bar-chart-line me-1"></i><span class="btn-label">Analytics</span>
     </a>
@@ -78,6 +93,22 @@
     <i class="bi bi-x-circle me-1"></i>Clear
   </button>
   <span id="filter-count" class="filter-count"></span>
+  <button id="select-btn" class="btn btn-sm select-toggle" onclick="App.toggleSelectMode()"
+          title="Select several events to delete them together">
+    <i class="bi bi-check2-square me-1"></i>Select
+  </button>
+</div>
+
+<!-- ── Bulk-select action bar (shown in select mode) ──────────────────────── -->
+<div id="select-bar" class="select-bar d-none" role="toolbar" aria-label="Selected events">
+  <span id="select-count" class="select-count"></span>
+  <button class="btn btn-link btn-sm" onclick="App.selectAllShown()">Select all shown</button>
+  <button class="btn btn-link btn-sm" onclick="App.clearSelection()">Clear</button>
+  <span class="select-bar-spacer"></span>
+  <button class="btn btn-danger btn-sm" id="select-delete-btn" onclick="App.deleteSelected()" disabled>
+    <i class="bi bi-trash3 me-1"></i><span class="select-delete-label">Delete</span>
+  </button>
+  <button class="btn btn-outline-secondary btn-sm" onclick="App.toggleSelectMode()">Done</button>
 </div>
 
 <!-- ── Legend strip ────────────────────────────────────────────────────────── -->
