@@ -46,6 +46,36 @@ _MAX_NOTE_IMAGES = 10
 init_db()
 
 
+# ── Security headers ─────────────────────────────────────────────────────────
+
+# Bootstrap, Bootstrap Icons, FullCalendar and Chart.js come from jsDelivr.
+# 'unsafe-inline' stays until the templates' onclick=/style= attributes and
+# inline <script> move into static/; drop it then for a strict policy. blob: is
+# for the note-photo previews shown before upload.
+SECURITY_HEADERS = {
+    "Content-Security-Policy": ("default-src 'self'; "
+                                "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
+                                "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
+                                "font-src 'self' data: https://cdn.jsdelivr.net; "
+                                "img-src 'self' data: blob:; "
+                                "object-src 'none'; base-uri 'none'; frame-ancestors 'none'; "
+                                "form-action 'self'"),
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Referrer-Policy": "same-origin",
+}
+
+
+@app.after_request
+def _security_headers(resp: Response) -> Response:
+    for name, value in SECURITY_HEADERS.items():
+        resp.headers.setdefault(name, value)
+    if request.path.startswith("/api/") or request.path == "/comments/report":
+        # Events carry onsite contact names and phone numbers; keep them out of shared caches.
+        resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
 # ── Pages ────────────────────────────────────────────────────────────────────
 
 @app.route("/")

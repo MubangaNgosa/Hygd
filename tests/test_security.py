@@ -68,3 +68,21 @@ def test_note_images_get_random_names(client, monkeypatch, tmp_path):
     [name] = client.app_module._save_note_images([f])
     assert name.endswith(".png") and "/" not in name and "evil" not in name
     assert (tmp_path / name).exists()
+
+
+@pytest.mark.parametrize("url", ["/", "/analytics", "/comments/report", "/api/stats",
+                                 "/note-images/missing.png"])
+def test_every_response_has_security_headers(client, url):
+    r = client.get(url)
+    csp = r.headers["Content-Security-Policy"]
+    assert "default-src 'self'" in csp and "frame-ancestors 'none'" in csp
+    assert r.headers["X-Content-Type-Options"] == "nosniff"
+    assert r.headers["X-Frame-Options"] == "DENY"
+    assert r.headers["Referrer-Policy"] == "same-origin"
+
+
+def test_event_data_is_not_cached_but_pages_are_unchanged(client):
+    assert client.get("/api/stats").headers["Cache-Control"] == "no-store"
+    assert client.get("/comments/report").headers["Cache-Control"] == "no-store"
+    assert client.get("/comments/report?format=csv").headers["Cache-Control"] == "no-store"
+    assert "no-store" not in client.get("/").headers.get("Cache-Control", "")
