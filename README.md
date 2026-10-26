@@ -129,8 +129,11 @@ Press **Ctrl + C** in the terminal. That releases port 5000.
 
 ### Notes
 
-- **`debug=True`** is on in `app.py`, so the server auto-reloads when you edit a
-  `.py` file. Editing `.html` / `.css` / `.js` only needs a browser refresh.
+- **`python app.py` is for local development only.** It listens on `127.0.0.1`
+  with the debugger off. `FLASK_DEBUG=1` turns on Flask's interactive debugger
+  (and auto-reload on `.py` edits), which lets anyone who can reach the port run
+  code on the machine, so never combine it with `HOST=0.0.0.0`. On a server,
+  always run Gunicorn. Editing `.html` / `.css` / `.js` only needs a browser refresh.
 - Uploading a PDF **adds** to what's already there. Use **Clear** in the app to
   wipe a date range (or everything) first. To reset completely, stop the app and
   delete `events.db` and the `uploads/layouts/` folder.
@@ -184,7 +187,7 @@ pip install -r requirements.txt
 ```bash
 cd /opt/hygd
 source .venv/bin/activate
-python app.py
+HOST=0.0.0.0 python app.py
 ```
 
 Open `http://your-server-ip:5000` in a browser. If the calendar loads, press `Ctrl+C` and continue to the next step.
@@ -288,7 +291,7 @@ The app is now live at `http://your-server-ip`.
    - With nginx:      `http://192.168.1.50`
    - Without nginx:   `http://192.168.1.50:5000`
 
-> The app binds to `0.0.0.0`, so it already accepts connections from other
+> Gunicorn binds to `0.0.0.0`, so it already accepts connections from other
 > devices — you only need the correct IP and an open firewall port. This is
 > LAN-only; nothing is exposed to the public internet.
 

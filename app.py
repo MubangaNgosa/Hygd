@@ -9,12 +9,14 @@ import csv
 import io
 import os
 import re
+import secrets
 import uuid
 from datetime import datetime, timedelta, timezone
 
 from dotenv import load_dotenv
 from flask import (Flask, Response, jsonify, render_template, request,
                    send_from_directory)
+from werkzeug.utils import secure_filename
 
 load_dotenv()
 
@@ -163,7 +165,15 @@ def upload():
     if not file.filename.lower().endswith(".pdf"):
         return jsonify({"error": "Only PDF files are supported"}), 400
 
-    dest = os.path.join(app.config["UPLOAD_FOLDER"], file.filename)
+    if file.stream.read(5) != b"%PDF-":
+        return jsonify({"error": "That file isn't a PDF"}), 400
+    file.stream.seek(0)
+
+    # Never trust the browser's filename: strip any path parts and prefix it so
+    # uploads can't land outside uploads/ or overwrite each other.
+    safe = secure_filename(file.filename) or "upload.pdf"
+    dest = os.path.join(app.config["UPLOAD_FOLDER"],
+                        f"{datetime.now():%Y%m%d-%H%M%S}-{secrets.token_hex(4)}-{safe}")
     file.save(dest)
 
     try:
@@ -200,8 +210,9 @@ def upload():
             "skipped":   skipped_count,
             "message":   " · ".join(parts),
         })
-    except Exception as exc:
-        return jsonify({"error": f"Parsing failed: {exc}"}), 500
+    except Exception:
+        app.logger.exception("Parsing %s failed", dest)
+        return jsonify({"error": "Parsing failed. Check that this is a MECS events PDF."}), 500
 
 
 # ── Events API ────────────────────────────────────────────────────────────────
@@ -584,5 +595,9 @@ def _group_past_map() -> dict:
 
 
 if __name__ == "__main__":
+    # The debugger runs any code it's sent, so it's opt-in and local by default.
+    # Set HOST=0.0.0.0 to reach the dev server from another machine (never with FLASK_DEBUG).
     port = int(os.environ.get("PORT", "5000"))
-    app.run(host="0.0.0.0", port=port, debug=True)
+    host = os.environ.get("HOST", "127.0.0.1")
+    debug = os.environ.get("FLASK_DEBUG", "").lower() in ("1", "true", "yes")
+    app.run(host=host, port=port, debug=debug)
