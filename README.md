@@ -61,7 +61,7 @@ hygd/
 ├── static/
 │   ├── style.css       # Brand styling (Hygd indigo, light + dark)
 │   └── app.js          # Calendar, filters, grouped view, event modal
-├── uploads/            # Uploaded PDFs (auto-created)
+├── uploads/            # Uploaded PDFs, deleted after 90 days (auto-created)
 │   └── layouts/        # Extracted room-layout diagram PNGs (auto-created)
 └── events.db           # SQLite database (auto-created on first run)
 ```
@@ -306,6 +306,8 @@ The app is now live at `http://your-server-ip`.
 
 > Uploading a new PDF **adds** to existing events. Use the **Clear** button first if you want to replace the calendar entirely with the new file.
 
+> Uploaded PDFs in `uploads/` are deleted after 90 days (checked on each upload); the events stay in the database. Note photos (`uploads/note_images/`) and layout diagrams (`uploads/layouts/`) are kept.
+
 ---
 
 ## Updating the app
@@ -382,3 +384,22 @@ sudo systemctl restart hygd
 
 **Port 5000 already in use**
 - Another process is on that port. Change the port in the `.service` file (`-b 0.0.0.0:5001`) and update the nginx `proxy_pass` to match.
+
+---
+
+## Security
+
+Every response carries a Content-Security-Policy that only allows scripts, styles and fonts from the app and `cdn.jsdelivr.net` (Bootstrap, Bootstrap Icons, FullCalendar, Chart.js), plus `data:` fonts and images and `blob:` images for the note-photo preview. If you load a library from anywhere else, add its origin to `SECURITY_HEADERS` in `app.py` or the browser will block it. Inline `onclick=`/`style=`/`<script>` are still allowed (`'unsafe-inline'`) until they move into `static/`.
+
+Keep the server patched once:
+
+```bash
+sudo apt install unattended-upgrades && sudo dpkg-reconfigure -plow unattended-upgrades
+```
+
+And check the Python packages for known vulnerabilities before each deploy, and at least once a term:
+
+```bash
+/opt/hygd/.venv/bin/pip install pip-audit
+/opt/hygd/.venv/bin/pip-audit -r /opt/hygd/requirements.txt
+```

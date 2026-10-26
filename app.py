@@ -10,8 +10,10 @@ import io
 import os
 import re
 import secrets
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from dotenv import load_dotenv
 from flask import (Flask, Response, jsonify, render_template, request,
@@ -184,6 +186,22 @@ def note_image(filename):
 
 # ── Upload ───────────────────────────────────────────────────────────────────
 
+UPLOAD_MAX_AGE = 90 * 24 * 3600  # events live in the DB; the PDFs are only kept for re-checking a parse
+
+
+def _prune_uploads() -> None:
+    """Delete uploaded PDFs past the retention window. They hold onsite contacts
+    the DB already has, so there's no reason to keep them forever. Only the
+    top level of uploads/ is touched: note_images/ and layouts/ are still in use."""
+    cutoff = time.time() - UPLOAD_MAX_AGE
+    for p in Path(app.config["UPLOAD_FOLDER"]).glob("*.pdf"):
+        try:
+            if p.is_file() and p.stat().st_mtime < cutoff:
+                p.unlink()
+        except OSError:  # already gone, or in use; the next upload tries again
+            pass
+
+
 @app.route("/upload", methods=["POST"])
 def upload():
     if "file" not in request.files:
@@ -201,6 +219,7 @@ def upload():
 
     # Never trust the browser's filename: strip any path parts and prefix it so
     # uploads can't land outside uploads/ or overwrite each other.
+    _prune_uploads()
     safe = secure_filename(file.filename) or "upload.pdf"
     dest = os.path.join(app.config["UPLOAD_FOLDER"],
                         f"{datetime.now():%Y%m%d-%H%M%S}-{secrets.token_hex(4)}-{safe}")

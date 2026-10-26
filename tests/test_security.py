@@ -3,7 +3,9 @@
 Run:  python -m pytest tests
 """
 import io
+import os
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -86,3 +88,27 @@ def test_event_data_is_not_cached_but_pages_are_unchanged(client):
     assert client.get("/comments/report").headers["Cache-Control"] == "no-store"
     assert client.get("/comments/report?format=csv").headers["Cache-Control"] == "no-store"
     assert "no-store" not in client.get("/").headers.get("Cache-Control", "")
+
+
+def test_uploads_past_retention_are_deleted(client):
+    old, fresh, other = client.uploads / "old.pdf", client.uploads / "fresh.pdf", client.uploads / "notes.txt"
+    photo = client.uploads / "note_images" / "photo.pdf"
+    layout = client.uploads / "layouts" / "layout_1_room_p1.png"
+    for p in (old, fresh, other, photo, layout):
+        p.parent.mkdir(exist_ok=True)
+        p.write_text("x")
+    stale = time.time() - client.app_module.UPLOAD_MAX_AGE - 60
+    for p in (old, other, photo, layout):
+        os.utime(p, (stale, stale))
+    client.app_module._prune_uploads()
+    assert not old.exists() and fresh.exists() and other.exists()
+    assert photo.exists() and layout.exists()
+
+
+def test_upload_runs_the_retention_rule(client):
+    old = client.uploads / "old.pdf"
+    old.write_text("x")
+    stale = time.time() - client.app_module.UPLOAD_MAX_AGE - 60
+    os.utime(old, (stale, stale))
+    _upload(client, "Daily Events.pdf")
+    assert not old.exists()
