@@ -8,7 +8,6 @@ Production:      gunicorn -w 2 -b 0.0.0.0:8000 app:app
 import csv
 import io
 import os
-import re
 import secrets
 import time
 import uuid
@@ -24,6 +23,7 @@ load_dotenv()
 
 from analytics import build_analytics
 from analytics import dept_category as _dept_category
+from analytics import group_key as _group_key
 from database import (add_note, count_events, count_events_in_range,
                       delete_all_events, delete_event, delete_events,
                       delete_events_in_range, delete_note, get_comments_report,
@@ -555,32 +555,6 @@ def _ids_from(data: dict):
         return sorted({int(i) for i in ids}), None
     except (ValueError, TypeError):
         return None, (jsonify({"error": "ids must be integers"}), 400)
-
-
-def _group_key(e: dict) -> str:
-    """
-    Stable colour-grouping key for an event.
-    Priority:
-      1. event_number — one group per booking, so separate bookings that share
-                        a (possibly truncated) name stay apart
-      2. booking #    — extracted from onsite_contact e.g. "Devan #189848"
-      3. event_name   — groups all rooms of the same named event
-      4. room + date  — unique fallback so unnamed/numberless events still render
-    """
-    number = (e.get("event_number") or "").strip().lstrip("#")
-    if number:
-        return f"#{number}"
-
-    contact = (e.get("onsite_contact") or "").strip()
-    m = re.search(r"#(\d+)", contact)
-    if m:
-        return f"#{m.group(1)}"
-
-    name = (e.get("event_name") or "").strip()
-    if name:
-        return name
-
-    return f"{e.get('room', 'unknown')}|{e.get('date', '')}"
 
 
 def _iso(date: str, time: str) -> str:

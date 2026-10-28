@@ -145,17 +145,30 @@ def _weekday(date_str: str) -> int | None:
         return None
 
 
-def _booking_key(e: dict) -> str:
-    """Stable key identifying one client booking: event name (case-folded),
-    else booking number from the onsite contact, else room+date. Unlike
-    app._group_key it does not split same-named bookings by event_number."""
-    name = (e.get("event_name") or "").strip()
-    if name:
-        return name.lower()
+def group_key(e: dict) -> str:
+    """
+    Stable key for one client booking, shared by the calendar's colour groups
+    and the analytics booking count.
+    Priority:
+      1. event_number — one group per booking, so separate bookings that share
+                        a (possibly truncated) name stay apart
+      2. booking #    — extracted from onsite_contact e.g. "Devan #189848"
+      3. event_name   — groups all rooms of the same named event
+      4. room + date  — unique fallback so unnamed/numberless events still render
+    """
+    number = (e.get("event_number") or "").strip().lstrip("#")
+    if number:
+        return f"#{number}"
+
     contact = (e.get("onsite_contact") or "").strip()
     m = re.search(r"#(\d+)", contact)
     if m:
         return f"#{m.group(1)}"
+
+    name = (e.get("event_name") or "").strip()
+    if name:
+        return name
+
     return f"{e.get('room', 'unknown')}|{e.get('date', '')}"
 
 
@@ -204,7 +217,7 @@ def _accumulate(agg: dict, e: dict) -> None:
     else:
         agg["active"] += 1
 
-    agg["bookings"].add(_booking_key(e))
+    agg["bookings"].add(group_key(e))
 
     cat = dept_category(e.get("department", ""), e.get("service_type", ""))
     agg["dept"][cat] += 1
