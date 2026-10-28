@@ -631,7 +631,9 @@ def _group_past_map() -> dict:
     Computed across every event in the DB (not just the requested range) so a
     booking that continues outside the loaded window isn't wrongly 'past'.
     """
-    now = datetime.now()
+    # Event times are venue-local and the server clock is UTC, so compare in
+    # venue time or events go 'past' ~7 hours early.
+    now = datetime.now(_venue_tz()).replace(tzinfo=None)
     last: dict = {}
     for e in get_events():
         key = _group_key(e)
