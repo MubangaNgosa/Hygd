@@ -2,7 +2,7 @@
 Hygd — event & room schedule. Flask application.
 
 Start locally:   python app.py
-Production:      gunicorn -w 2 -b 0.0.0.0:5000 app:app
+Production:      gunicorn -w 2 -b 0.0.0.0:8000 app:app
 """
 
 import csv
@@ -24,11 +24,11 @@ load_dotenv()
 
 from analytics import build_analytics
 from analytics import dept_category as _dept_category
-from database import (add_note, count_events_in_range, delete_all_events,
-                      delete_event, delete_events, delete_events_in_range,
-                      delete_note, get_comments_report, get_event_by_id, get_events,
-                      get_notes,
-                      get_stats, get_unread_notes, init_db, save_events,
+from database import (add_note, count_events, count_events_in_range,
+                      delete_all_events, delete_event, delete_events,
+                      delete_events_in_range, delete_note, get_comments_report,
+                      get_event_by_id, get_events, get_notes,
+                      get_unread_notes, init_db, save_events,
                       set_event_hidden, set_events_hidden, set_event_progress,
                       toggle_reaction, update_note)
 from parser import extract_and_parse_pdf
@@ -234,30 +234,17 @@ def upload():
             return jsonify({
                 "success": True,
                 "no_changes": True,
-                "message": (
-                    f"No changes — all {skipped_count} event"
-                    f"{'s' if skipped_count != 1 else ''} in this PDF are already up to date."
-                ),
+                "message": (f"No changes — all {_plural(skipped_count, 'event')} "
+                            "in this PDF are already up to date."),
             })
 
-        # Build a human-readable summary
-        parts = []
-        if new_count:
-            parts.append(f"{new_count} new event{'s' if new_count != 1 else ''} added")
-        if updated_count:
-            parts.append(f"{updated_count} event{'s' if updated_count != 1 else ''} updated")
-        if cancelled_count:
-            parts.append(f"{cancelled_count} marked as cancelled")
-        if skipped_count:
-            parts.append(f"{skipped_count} already up to date")
-
+        # The browser builds its own summary from these counts.
         return jsonify({
             "success": True,
             "new":       new_count,
             "updated":   updated_count,
             "cancelled": cancelled_count,
             "skipped":   skipped_count,
-            "message":   " · ".join(parts),
         })
     except Exception:
         app.logger.exception("Parsing %s failed", dest)
@@ -310,14 +297,6 @@ def api_events():
         })
 
     return jsonify(fc_events)
-
-
-@app.route("/api/events/<int:event_id>")
-def api_event_detail(event_id):
-    event = get_event_by_id(event_id)
-    if event:
-        return jsonify(event)
-    return jsonify({"error": "Not found"}), 404
 
 
 @app.route("/api/events/<int:event_id>", methods=["DELETE"])
@@ -405,7 +384,7 @@ def api_add_note(event_id):
 
     # Photos arrive as multipart/form-data; a plain text note still comes as JSON.
     if request.files:
-        author = str(request.form.get("author", "")).strip()[:_MAX_AUTHOR]
+        author = _author(request.form)
         text   = str(request.form.get("text", "")).strip()[:_MAX_NOTE]
         images = _save_note_images(request.files.getlist("images"))
     else:
@@ -504,14 +483,10 @@ def api_event_hidden(event_id):
 def api_events_hidden_bulk():
     """Hide or unhide many events at once (e.g. a whole grouped booking)."""
     data   = request.get_json(silent=True) or {}
-    ids    = data.get("ids")
     hidden = bool(data.get("hidden"))
-    if not isinstance(ids, list) or not ids:
-        return jsonify({"error": "ids (non-empty list) required"}), 400
-    try:
-        ids = [int(i) for i in ids]
-    except (ValueError, TypeError):
-        return jsonify({"error": "ids must be integers"}), 400
+    ids, err = _ids_from(data)
+    if err:
+        return err
     n = set_events_hidden(ids, hidden)
     return jsonify({"success": True, "hidden": hidden, "updated": n})
 
@@ -519,18 +494,13 @@ def api_events_hidden_bulk():
 @app.route("/api/events/delete", methods=["POST"])
 def api_delete_events_bulk():
     """Delete several selected events (and their comments) at once."""
-    data = request.get_json(silent=True) or {}
-    ids  = data.get("ids")
-    if not isinstance(ids, list) or not ids:
-        return jsonify({"error": "ids (non-empty list) required"}), 400
-    try:
-        ids = sorted({int(i) for i in ids})
-    except (ValueError, TypeError):
-        return jsonify({"error": "ids must be integers"}), 400
+    ids, err = _ids_from(request.get_json(silent=True) or {})
+    if err:
+        return err
     count, images = delete_events(ids)
     _delete_note_images(images)
     return jsonify({"success": True, "deleted": count,
-                    "message": f"Deleted {count} event{'s' if count != 1 else ''}"})
+                    "message": f"Deleted {_plural(count, 'event')}"})
 
 
 @app.route("/api/events/clear", methods=["POST"])
@@ -541,7 +511,7 @@ def api_clear():
     if start and end:
         count = delete_events_in_range(start, end)
         return jsonify({"success": True, "count": count,
-                        "message": f"Cleared {count} event{'s' if count != 1 else ''}"})
+                        "message": f"Cleared {_plural(count, 'event')}"})
     # Fallback: clear everything (used by the "Clear all" option in the modal)
     delete_all_events()
     return jsonify({"success": True, "message": "All events cleared"})
@@ -558,7 +528,7 @@ def api_count_range():
 
 @app.route("/api/stats")
 def api_stats():
-    return jsonify(get_stats())
+    return jsonify({"total": count_events()})
 
 
 @app.route("/api/analytics")
@@ -569,6 +539,23 @@ def api_analytics():
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _plural(n: int, word: str) -> str:
+    """3, 'event' → '3 events'; 1, 'event' → '1 event'."""
+    return f"{n} {word}{'s' if n != 1 else ''}"
+
+
+def _ids_from(data: dict):
+    """The request's `ids` as a sorted, de-duplicated int list, or an error
+    response to return instead."""
+    ids = data.get("ids")
+    if not isinstance(ids, list) or not ids:
+        return None, (jsonify({"error": "ids (non-empty list) required"}), 400)
+    try:
+        return sorted({int(i) for i in ids}), None
+    except (ValueError, TypeError):
+        return None, (jsonify({"error": "ids must be integers"}), 400)
+
 
 def _group_key(e: dict) -> str:
     """

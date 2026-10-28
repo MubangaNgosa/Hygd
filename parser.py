@@ -36,11 +36,7 @@ _MONTHS = {
     'September': 9, 'October': 10, 'November': 11, 'December': 12,
 }
 
-_MONTHS_ABBR = {
-    'Jan': 1, 'Feb': 2, 'Mar': 3, 'Apr': 4,
-    'May': 5, 'Jun': 6, 'Jul': 7, 'Aug': 8,
-    'Sep': 9, 'Oct': 10, 'Nov': 11, 'Dec': 12,
-}
+_MONTHS_ABBR = {name[:3]: num for name, num in _MONTHS.items()}
 
 # ── Boilerplate text that appears inside every "Rooms Built-in Equipment" item.
 # Detected by first-word match so we don't hard-code full sentences.
@@ -236,11 +232,8 @@ def _parse_lines(lines: list[str]) -> list[dict]:
 
 def _is_services_by_function_format(text: str) -> bool:
     """Detect the second PDF format by its title or its event-header line."""
-    if 'Services by Function Date' in text:
-        return True
-    if re.search(r'^Event:\s+#\s*\d+', text, re.MULTILINE):
-        return True
-    return False
+    return ('Services by Function Date' in text
+            or bool(re.search(r'^Event:\s+#\s*\d+', text, re.MULTILINE)))
 
 
 def _split_fd_room_service(text: str) -> tuple[str, str, str]:
@@ -512,6 +505,11 @@ _BS_STATUS_RE = re.compile(rf'^(.*?)(?:\s+({_BS_PROVIDERS}):)?$')
 # They are never taken as the department, so the function's own service type
 # (or a later provider heading) decides its category instead.
 _BS_NOT_PROVIDERS = {'event details'}
+# Item rows carry a quantity and a price before the unit, e.g.
+#   "1.0 0.00 EA Room Set Diagram" · "13.0 40.00 /HR Technician" · "1.0 (350.00)EA Discount"
+_BS_ITEM_RE    = re.compile(
+    r'^(\d+(?:\.\d+)?)\s+\(?[\d,]+\.\d{2}\)?\s*(/?(?:EA|HR|PRS))\b\s*(.*)$'
+)
 
 
 def _set_bs_department(ev: dict, provider: str) -> None:
@@ -521,11 +519,6 @@ def _set_bs_department(ev: dict, provider: str) -> None:
     provider = provider.rstrip(':').strip()
     if provider and provider.lower() not in _BS_NOT_PROVIDERS and not ev.get('department'):
         ev['department'] = provider
-# Item rows carry a quantity and a price before the unit, e.g.
-#   "1.0 0.00 EA Room Set Diagram" · "13.0 40.00 /HR Technician" · "1.0 (350.00)EA Discount"
-_BS_ITEM_RE    = re.compile(
-    r'^(\d+(?:\.\d+)?)\s+\(?[\d,]+\.\d{2}\)?\s*(/?(?:EA|HR|PRS))\b\s*(.*)$'
-)
 
 
 def _is_by_space_format(text: str) -> bool:
@@ -809,7 +802,7 @@ def _dedupe_events(events: list[dict]) -> list[dict]:
 def extract_and_parse_pdf(pdf_path: str, pdf_source: str = '') -> list[dict]:
     """
     Extract text from every page and parse events with regex. Auto-detects which
-    of the two MECS PDF formats is in use. No API key required.
+    of the three MECS PDF formats is in use. No API key required.
     """
     pages = extract_pages(pdf_path)
     full_text = '\n'.join(pages)

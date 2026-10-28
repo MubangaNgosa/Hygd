@@ -208,6 +208,8 @@ body {
 
 /* Setup items list */
 .setup-section h6 {
+  display: flex;
+  align-items: center;
   font-weight: 700;
   text-transform: uppercase;
   font-size: .75rem;
@@ -251,7 +253,6 @@ body {
 }
 
 /* Checklist (tickable setup items) */
-.setup-section h6 { display: flex; align-items: center; }
 .setup-progress {
   margin-left: auto;
   font-size: .72rem;
@@ -349,6 +350,7 @@ body {
   border-color: #c7d2fe;
 }
 .note-head {
+  position: relative;   /* anchors the reaction picker */
   display: flex;
   align-items: center;
   gap: .5rem;
@@ -1813,7 +1815,6 @@ body.analytics-body { overflow: hidden; }
 }
 
 /* ── Note reactions ───────────────────────────────────────────────────────── */
-.note-head { position: relative; }
 .note-reactions { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
 .reaction-chip {
   display: inline-flex;

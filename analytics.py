@@ -16,6 +16,7 @@ first/last day of instruction, so every date buckets cleanly and predictably.
 
 import re
 from collections import Counter, defaultdict
+from datetime import date
 
 # ── Semesters ──────────────────────────────────────────────────────────────────
 
@@ -137,18 +138,17 @@ def _duration_minutes(start: str, end: str) -> int | None:
 
 
 def _weekday(date_str: str) -> int | None:
-    """0=Mon … 6=Sun for a 'YYYY-MM-DD' date (Zeller-free, via datetime)."""
+    """0=Mon … 6=Sun for a 'YYYY-MM-DD' date."""
     try:
-        from datetime import date
-        y, m, d = int(date_str[0:4]), int(date_str[5:7]), int(date_str[8:10])
-        return date(y, m, d).weekday()
+        return date.fromisoformat(date_str[:10]).weekday()
     except (ValueError, TypeError):
         return None
 
 
 def _booking_key(e: dict) -> str:
-    """Stable key identifying one client booking (mirrors app._group_key):
-    event name, else booking number from the onsite contact, else room+date."""
+    """Stable key identifying one client booking: event name (case-folded),
+    else booking number from the onsite contact, else room+date. Unlike
+    app._group_key it does not split same-named bookings by event_number."""
     name = (e.get("event_name") or "").strip()
     if name:
         return name.lower()
@@ -264,12 +264,11 @@ def _accumulate(agg: dict, e: dict) -> None:
         agg["with_notes"] += 1
 
     for it in e.get("setup_items", []) or []:
-        label = _norm_item(it.get("item", "")) if isinstance(it, dict) else _norm_item(str(it))
+        label = _norm_item(it.get("item", ""))
         if not label:
             continue
         agg["item_count"][label] += 1
-        if isinstance(it, dict):
-            agg["item_qty"][label] += _qty_of(it.get("qty", ""))
+        agg["item_qty"][label] += _qty_of(it.get("qty", ""))
 
 
 def _finalize(agg: dict) -> dict:
@@ -305,8 +304,8 @@ def _finalize(agg: dict) -> dict:
             "att_total": agg["att_sum"],
             "att_avg": round(agg["att_sum"] / att_n) if att_n else 0,
             "att_peak": agg["att_peak"],
-            "rooms": len([r for r in agg["room"]]),
-            "buildings": len([b for b in agg["building"]]),
+            "rooms": len(agg["room"]),
+            "buildings": len(agg["building"]),
             "dur_avg": round(agg["dur_sum"] / dur_n) if dur_n else 0,
             "with_layout": agg["with_layout"],
             "with_notes": agg["with_notes"],

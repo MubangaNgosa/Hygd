@@ -154,7 +154,7 @@ def _content_changed(existing: dict, new: dict, setup_json: str,
 
 def save_events(events: list[dict]) -> tuple[int, int, int, int]:
     """
-    Upsert events matched by (date, start_time, end_time, room).
+    Upsert events matched by (date, start_time, end_time, room, service_type).
 
     Returns (new_count, updated_count, cancelled_count, skipped_count).
 
@@ -171,7 +171,7 @@ def save_events(events: list[dict]) -> tuple[int, int, int, int]:
     cancelled_count = 0
     skipped_count   = 0
 
-    # Track which (date, start_time, end_time, room) tuples appear in the new PDF
+    # Track which (date, start_time, end_time, room, service_type) keys appear in the new PDF
     seen_keys: set[tuple] = set()
     # Track every date the new PDF carries an event on, so we can derive the
     # date window it covers for omission cancellation.
@@ -299,16 +299,30 @@ def save_events(events: list[dict]) -> tuple[int, int, int, int]:
 
 # ── Queries ───────────────────────────────────────────────────────────────────
 
+def _json_list(value) -> list:
+    """A JSON-encoded list column → list; anything unreadable → []."""
+    try:
+        v = json.loads(value or '[]')
+    except (json.JSONDecodeError, TypeError):
+        return []
+    return v if isinstance(v, list) else []
+
+
+def _decode_event(row) -> dict:
+    """Events row → dict with its JSON list columns parsed."""
+    e = dict(row)
+    e['setup_items'] = _json_list(e.get('setup_items'))
+    e['checked_items'] = _json_list(e.get('checked_items'))
+    e['manually_complete'] = bool(e.get('manually_complete', 0))
+    _decode_layout_images(e)
+    return e
+
+
 def _decode_layout_images(e: dict) -> None:
     """Parse the layout_images JSON list and reconcile it with the legacy
     single `layout_image` column, so rows written before multi-diagram support
     (which only have `layout_image`) still surface their diagram as a list."""
-    try:
-        imgs = json.loads(e.get('layout_images') or '[]')
-        if not isinstance(imgs, list):
-            imgs = []
-    except (json.JSONDecodeError, TypeError):
-        imgs = []
+    imgs = _json_list(e.get('layout_images'))
     primary = (e.get('layout_image') or '').strip()
     if not imgs and primary:
         imgs = [primary]
@@ -339,17 +353,7 @@ def get_events(start: str = None, end: str = None) -> list[dict]:
 
     result = []
     for row in rows:
-        e = dict(row)
-        try:
-            e['setup_items'] = json.loads(e.get('setup_items') or '[]')
-        except (json.JSONDecodeError, TypeError):
-            e['setup_items'] = []
-        try:
-            e['checked_items'] = json.loads(e.get('checked_items') or '[]')
-        except (json.JSONDecodeError, TypeError):
-            e['checked_items'] = []
-        e['manually_complete'] = bool(e.get('manually_complete', 0))
-        _decode_layout_images(e)
+        e = _decode_event(row)
         e['note_count'] = note_counts.get(e['id'], 0)
         result.append(e)
     return result
@@ -359,20 +363,7 @@ def get_event_by_id(event_id: int) -> dict | None:
     conn = get_connection()
     row = conn.execute('SELECT * FROM events WHERE id = ?', (event_id,)).fetchone()
     conn.close()
-    if row:
-        e = dict(row)
-        try:
-            e['setup_items'] = json.loads(e.get('setup_items') or '[]')
-        except (json.JSONDecodeError, TypeError):
-            e['setup_items'] = []
-        try:
-            e['checked_items'] = json.loads(e.get('checked_items') or '[]')
-        except (json.JSONDecodeError, TypeError):
-            e['checked_items'] = []
-        e['manually_complete'] = bool(e.get('manually_complete', 0))
-        _decode_layout_images(e)
-        return e
-    return None
+    return _decode_event(row) if row else None
 
 
 def delete_event(event_id: int):
@@ -398,10 +389,7 @@ def delete_events(event_ids: list[int]) -> tuple[int, list[str]]:
     for row in conn.execute(
         f"SELECT images FROM notes WHERE event_id IN ({placeholders})", event_ids
     ).fetchall():
-        try:
-            images.extend(json.loads(row['images'] or '[]'))
-        except (json.JSONDecodeError, TypeError):
-            pass
+        images.extend(_json_list(row['images']))
     conn.execute(f'DELETE FROM notes WHERE event_id IN ({placeholders})', event_ids)
     _prune_reactions(conn)
     cur = conn.execute(f'DELETE FROM events WHERE id IN ({placeholders})', event_ids)
@@ -485,10 +473,7 @@ _NOTE_COLS = "id, event_id, author, text, images, created_at, updated_at"
 def _decode_note(row) -> dict:
     """Row → dict with `images` parsed from its JSON list."""
     n = dict(row)
-    try:
-        n['images'] = json.loads(n.get('images') or '[]')
-    except (json.JSONDecodeError, TypeError):
-        n['images'] = []
+    n['images'] = _json_list(n.get('images'))
     return n
 
 
@@ -690,10 +675,7 @@ def delete_note(note_id: int, author: str) -> list | None:
     if row is None:
         conn.close()
         return None
-    try:
-        images = json.loads(row['images'] or '[]')
-    except (json.JSONDecodeError, TypeError):
-        images = []
+    images = _json_list(row['images'])
     conn.execute("DELETE FROM notes WHERE id=? AND author=?", (note_id, author))
     _prune_reactions(conn)
     conn.commit()
@@ -739,21 +721,11 @@ def delete_all_events():
     conn.close()
 
 
-def get_stats() -> dict:
+def count_events() -> int:
     conn = get_connection()
-    total     = conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
-    active    = conn.execute("SELECT COUNT(*) FROM events WHERE status != 'cancelled'").fetchone()[0]
-    cancelled = conn.execute("SELECT COUNT(*) FROM events WHERE status = 'cancelled'").fetchone()[0]
-    sources   = conn.execute(
-        'SELECT pdf_source, COUNT(*) as cnt FROM events GROUP BY pdf_source'
-    ).fetchall()
+    total = conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
     conn.close()
-    return {
-        'total':     total,
-        'active':    active,
-        'cancelled': cancelled,
-        'sources':   [{'name': r['pdf_source'], 'count': r['cnt']} for r in sources],
-    }
+    return total
 
 
 def _normalize_time(t: str) -> str:

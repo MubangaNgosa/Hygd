@@ -19,14 +19,10 @@ const PALETTE = [
   '#a06850', // sienna
 ];
 
-const _colorCache = {};
 function eventColor(name) {
-  if (_colorCache[name]) return _colorCache[name];
   let h = 0;
   for (let i = 0; i < name.length; i++) h = (Math.imul(31, h) + name.charCodeAt(i)) | 0;
-  const color = PALETTE[Math.abs(h) % PALETTE.length];
-  _colorCache[name] = color;
-  return color;
+  return PALETTE[Math.abs(h) % PALETTE.length];
 }
 
 // ── Track which event is open in the detail modal ────────────────────────
@@ -72,7 +68,6 @@ function renderIdentity() {
 // so a new browser doesn't flag every comment ever posted.
 const SEEN_NOTES_KEY  = 'hygd_seen_note_ids';  // { eventId: lastSeenNoteId }
 const SEEN_FLOOR_KEY  = 'hygd_seen_floor';
-const LEGACY_SEEN_KEY = 'hygd_seen_notes';     // old per-event *count* map
 
 let _unread = [];         // unread notes across all events, newest first
 let _unreadByEvent = {};  // eventId (string) → unread count
@@ -143,10 +138,7 @@ async function refreshUnread() {
     const data = await res.json();
     if (floor == null) {
       // First visit with id-based tracking: start from now.
-      try {
-        localStorage.setItem(SEEN_FLOOR_KEY, String(data.max_id || 0));
-        localStorage.removeItem(LEGACY_SEEN_KEY);
-      } catch (_) {}
+      try { localStorage.setItem(SEEN_FLOOR_KEY, String(data.max_id || 0)); } catch (_) {}
       _unread = [];
     } else {
       _unread = data.notes || [];
@@ -186,10 +178,17 @@ async function loadNotes(eventId) {
 function syncNoteCount(id, count) {
   const raw  = _eventsById[id];
   const prev = raw ? (raw.extendedProps.note_count || 0) : count;
-  if (raw) raw.extendedProps.note_count = count;
-  const fcEv = calendar.getEventById(String(id));
-  if (fcEv) fcEv.setExtendedProp('note_count', count);
+  setCachedProp(id, 'note_count', count);
   if (prev !== count) _notesTouched = true;
+}
+
+// Mirror a changed property into both in-memory copies of an event (the raw
+// /api/events object and FullCalendar's), so reopening it shows the new value.
+function setCachedProp(id, key, value) {
+  const raw = _eventsById[id];
+  if (raw) raw.extendedProps[key] = value;
+  const fcEv = calendar.getEventById(String(id));
+  if (fcEv) fcEv.setExtendedProp(key, value);
 }
 
 function renderNotes(notes) {
@@ -199,8 +198,7 @@ function renderNotes(notes) {
   if (list.querySelector('.note-item.editing, .reaction-picker')) return;
 
   const syncEl = document.getElementById('notes-sync');
-  if (syncEl) syncEl.textContent = notes.length
-    ? `${notes.length} comment${notes.length !== 1 ? 's' : ''}` : '';
+  if (syncEl) syncEl.textContent = notes.length ? plural(notes.length, 'comment') : '';
 
   if (!notes.length) {
     list.innerHTML = '<div class="notes-empty text-muted small">No notes yet — add the first one below.</div>';
@@ -289,10 +287,15 @@ function stopNotesPoll() {
   if (_notesPollTimer) { clearInterval(_notesPollTimer); _notesPollTimer = null; }
 }
 
-// "2026-07-28 14:03:12" (SQLite UTC) → localized short date + time
+// "2026-07-28 14:03:12" (SQLite UTC) → Date
+function parseSqliteUtc(ts) {
+  return new Date(ts.replace(' ', 'T') + 'Z');
+}
+
+// SQLite UTC timestamp → localized short date + time
 function fmtNoteTime(ts) {
   if (!ts) return '';
-  const d = new Date(ts.replace(' ', 'T') + 'Z');
+  const d = parseSqliteUtc(ts);
   if (isNaN(d)) return ts;
   return d.toLocaleString('en-CA', {
     month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false,
@@ -306,10 +309,7 @@ let ALL_EVENTS = [];
 let _eventsById = {};
 let groupedMode = false;
 let showHidden  = false;   // reveal events that users have hidden
-// Past events are shown by default (greyed + badged, never auto-hidden). The
-// "past" detection currently mis-flags some events that haven't started yet
-// (suspected server-vs-venue timezone mismatch in group_past), so auto-hiding is
-// disabled until that's fixed — the toggle can still collapse them manually.
+// Past events are shown by default (greyed + badged); the toggle collapses them.
 let showPast    = true;    // reveal events whose group's last instance has passed
 const FILTERS = { depts: new Set(), q: '', cancelledOnly: false };
 let _searchTimer = null;   // debounce handle for the search box
@@ -544,35 +544,29 @@ async function refreshBadge() {
   try {
     const res  = await fetch('/api/stats');
     const data = await res.json();
-    document.getElementById('event-count-badge').textContent =
-      `${data.total} event${data.total !== 1 ? 's' : ''}`;
+    document.getElementById('event-count-badge').textContent = plural(data.total, 'event');
   } catch (_) {}
 }
 
-// Reflect how many events are hidden + whether they're currently revealed
-function updateHiddenButton() {
-  const btn = document.getElementById('hidden-btn');
+// Reflect how many events carry `prop` + whether they're currently revealed
+function updateRevealButton(btnId, prop, on, word, iconOn, iconOff) {
+  const btn = document.getElementById(btnId);
   if (!btn) return;
-  const count = ALL_EVENTS.filter(e => e.extendedProps.hidden).length;
+  const count = ALL_EVENTS.filter(e => e.extendedProps[prop]).length;
   const icon  = btn.querySelector('i');
   const label = btn.querySelector('.btn-label');
-  btn.classList.toggle('active', showHidden);
-  if (icon)  icon.className = (showHidden ? 'bi bi-eye' : 'bi bi-eye-slash') + ' me-1';
+  btn.classList.toggle('active', on);
+  if (icon)  icon.className = `bi ${on ? iconOn : iconOff} me-1`;
   if (label) label.textContent =
-    (showHidden ? 'Showing hidden' : 'Show hidden') + (count ? ` (${count})` : '');
+    (on ? `Showing ${word}` : `Show ${word}`) + (count ? ` (${count})` : '');
 }
 
-// Reflect how many events are past + whether they're currently revealed
+function updateHiddenButton() {
+  updateRevealButton('hidden-btn', 'hidden', showHidden, 'hidden', 'bi-eye', 'bi-eye-slash');
+}
+
 function updatePastButton() {
-  const btn = document.getElementById('past-btn');
-  if (!btn) return;
-  const count = ALL_EVENTS.filter(e => e.extendedProps.group_past).length;
-  const icon  = btn.querySelector('i');
-  const label = btn.querySelector('.btn-label');
-  btn.classList.toggle('active', showPast);
-  if (icon)  icon.className = (showPast ? 'bi bi-clock' : 'bi bi-clock-history') + ' me-1';
-  if (label) label.textContent =
-    (showPast ? 'Showing past' : 'Show past') + (count ? ` (${count})` : '');
+  updateRevealButton('past-btn', 'group_past', showPast, 'past', 'bi-clock', 'bi-clock-history');
 }
 
 // Header pill: total unread comments across all events. Clicking it opens the
@@ -585,7 +579,7 @@ function updateUnseenBadge() {
   badge.classList.toggle('d-none', total === 0);
   if (total > 0) {
     badge.innerHTML = `<i class="bi bi-chat-dots-fill me-1"></i>${total}<span class="unseen-label"> new comment${total !== 1 ? 's' : ''}</span>`;
-    badge.title = `${events} event${events !== 1 ? 's' : ''} with new comments — click to view`;
+    badge.title = `${plural(events, 'event')} with new comments — click to view`;
   } else {
     closeInbox();
   }
@@ -654,7 +648,7 @@ function fmtInboxDate(date, time) {
 // SQLite UTC timestamp → "just now" / "5m ago" / "3h ago" / "2d ago" / date
 function fmtRelative(ts) {
   if (!ts) return '';
-  const d = new Date(ts.replace(' ', 'T') + 'Z');
+  const d = parseSqliteUtc(ts);
   if (isNaN(d)) return ts;
   const mins = Math.round((Date.now() - d) / 60000);
   if (mins < 1)  return 'just now';
@@ -748,7 +742,7 @@ function updateFilterMeta(total) {
   const active = FILTERS.depts.size > 0 || !!FILTERS.q || FILTERS.cancelledOnly;
   const meta   = document.getElementById('filter-count');
   const clear  = document.getElementById('clear-filters');
-  meta.textContent = active ? `Showing ${shown} of ${total}` : `${total} event${total !== 1 ? 's' : ''}`;
+  meta.textContent = active ? `Showing ${shown} of ${total}` : plural(total, 'event');
   clear.classList.toggle('d-none', !active);
 }
 
@@ -817,9 +811,7 @@ function decorateEvent(info, isList) {
     const s = document.createElement('span');
     s.className = 'note-flag' + (unseen > 0 ? ' has-unseen' : '');
     s.innerHTML = `<i class="bi bi-chat-dots-fill"></i> ${p.note_count}`;
-    s.title = unseen > 0
-      ? `${p.note_count} comment${p.note_count !== 1 ? 's' : ''} — ${unseen} new`
-      : `${p.note_count} comment${p.note_count !== 1 ? 's' : ''}`;
+    s.title = plural(p.note_count, 'comment') + (unseen > 0 ? ` — ${unseen} new` : '');
     titleEl.appendChild(s);
   }
   if (p.hidden && !titleEl.querySelector('.hidden-flag')) {
@@ -967,7 +959,7 @@ function renderGrouped(list) {
       const flag = p.layout_image ? '<span class="ev-flag" title="Room layout available">🗺</span>' : '';
       const unseen = unseenNoteCount(e.id);
       const noteFlag = p.note_count > 0
-        ? `<span class="note-flag${unseen > 0 ? ' has-unseen' : ''}" title="${p.note_count} comment${p.note_count !== 1 ? 's' : ''}${unseen > 0 ? ` — ${unseen} new` : ''}"><i class="bi bi-chat-dots-fill"></i> ${p.note_count}</span>` : '';
+        ? `<span class="note-flag${unseen > 0 ? ' has-unseen' : ''}" title="${plural(p.note_count, 'comment')}${unseen > 0 ? ` — ${unseen} new` : ''}"><i class="bi bi-chat-dots-fill"></i> ${p.note_count}</span>` : '';
       const hiddenFlag = p.hidden
         ? '<span class="hidden-flag" title="Hidden event"><i class="bi bi-eye-slash"></i></span>' : '';
       const complete = eventIsComplete(p);
@@ -1008,8 +1000,8 @@ function renderGrouped(list) {
           <span class="group-name">${escHtml(g.name)}</span>
           ${g.dateMin ? `<span class="group-date"><i class="bi bi-calendar-event me-1"></i>${escHtml(fmtDateRange(g.dateMin, g.dateMax))}</span>` : ''}
           <span class="group-meta">
-            ${g.events.length} function${g.events.length !== 1 ? 's' : ''}
-            · ${g.rooms} room${g.rooms !== 1 ? 's' : ''}
+            ${plural(g.events.length, 'function')}
+            · ${plural(g.rooms, 'room')}
             ${span ? '· ' + escHtml(span) : ''}
             ${g.layouts ? '· 🗺 ' + g.layouts : ''}
             ${g.contact ? '· ' + escHtml(g.contact) : ''}
@@ -1057,7 +1049,7 @@ function showEventModal(event) {
 
   const isCancelled = props.status === 'cancelled';
 
-  // Header — tint red for normal, grey for cancelled
+  // Header — indigo gradient for normal, grey for cancelled
   const hdr = document.getElementById('event-modal-header');
   hdr.style.background = isCancelled
     ? 'linear-gradient(135deg, #555, #777)'
@@ -1149,9 +1141,8 @@ function showEventModal(event) {
 
   // Room layout diagrams (auto-extracted screenshots). A single function can
   // carry several diagrams across continuation pages, so render them as a gallery.
-  const layoutImgs = (props.layout_images && props.layout_images.length)
-    ? props.layout_images
-    : (props.layout_image ? [props.layout_image] : []);
+  // The server already folds the legacy single layout_image into this list.
+  const layoutImgs = props.layout_images || [];
   const layoutHtml = layoutImgs.length
     ? `<div class="layout-section mb-3">
          <h6>Room Layout${layoutImgs.length > 1
@@ -1169,8 +1160,8 @@ function showEventModal(event) {
 
   // Notes
   const notesHtml = props.notes
-    ? `<div class="mb-3">
-         <h6 class="setup-section" style="font-weight:700;text-transform:uppercase;font-size:.75rem;letter-spacing:.06em;color:#6c757d;margin-bottom:.6rem;">Notes</h6>
+    ? `<div class="setup-section mb-3">
+         <h6>Notes</h6>
          <div class="notes-block">${boldAfterNote(props.notes)}</div>
        </div>`
     : '';
@@ -1289,16 +1280,20 @@ async function saveManualComplete(id, complete) {
   const done  = body.querySelectorAll('.item-check:checked').length;
   if (hint) hint.classList.toggle('d-none', !(complete && total > 0 && done < total));
 
-  updateManualCompleteCache(id, complete);   // optimistic
-  _checklistTouched = true;                   // refresh line styling on close
+  setCachedProp(id, 'manually_complete', complete);   // optimistic
+  _checklistTouched = true;                            // refresh line styling on close
+  await postProgress(id, { manually_complete: complete });
+}
 
+// Persist part of an event's progress; failures are silent (the next refetch
+// shows what the server actually has).
+async function postProgress(id, body) {
   try {
-    const res = await fetch(`/api/events/${id}/progress`, {
+    await fetch(`/api/events/${id}/progress`, {
       method:  'POST',
       headers: { 'Content-Type': 'application/json' },
-      body:    JSON.stringify({ manually_complete: complete }),
+      body:    JSON.stringify(body),
     });
-    if (!res.ok) throw new Error('save failed');
   } catch (_) {}
 }
 
@@ -1321,33 +1316,9 @@ async function saveProgress(id) {
     hint.classList.toggle('d-none', !overriding);
   }
 
-  updateProgressCache(id, checked);   // optimistic — keeps this session in sync
-  _checklistTouched = true;           // refresh line styling (complete state) on modal close
-
-  try {
-    const res = await fetch(`/api/events/${id}/progress`, {
-      method:  'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body:    JSON.stringify({ checked_items: checked }),
-    });
-    if (!res.ok) throw new Error('save failed');
-  } catch (_) {}
-}
-
-// Mirror saved progress into the in-memory caches so reopening shows it
-function updateProgressCache(id, checked) {
-  const raw = _eventsById[id];
-  if (raw) raw.extendedProps.checked_items = checked;
-  const fcEv = calendar.getEventById(String(id));
-  if (fcEv) fcEv.setExtendedProp('checked_items', checked);
-}
-
-// Mirror the manual "mark complete" flag into the in-memory caches
-function updateManualCompleteCache(id, complete) {
-  const raw = _eventsById[id];
-  if (raw) raw.extendedProps.manually_complete = complete;
-  const fcEv = calendar.getEventById(String(id));
-  if (fcEv) fcEv.setExtendedProp('manually_complete', complete);
+  setCachedProp(id, 'checked_items', checked);   // optimistic — keeps this session in sync
+  _checklistTouched = true;                      // refresh line styling (complete state) on modal close
+  await postProgress(id, { checked_items: checked });
 }
 
 // ── Upload ────────────────────────────────────────────────────────────────
@@ -1425,16 +1396,12 @@ async function doUpload(file) {
 
     const data = await res.json();
 
-    if (data.error) {
-      alert.innerHTML = errorAlert(data.error);
-    } else if (data.no_changes) {
+    if (data.no_changes) {
       alert.innerHTML = noChangesAlert(data.message);
-    } else if (data.success) {
+    } else {
       alert.innerHTML = uploadSummaryAlert(data);
       calendar.refetchEvents();
       refreshBadge();
-    } else {
-      alert.innerHTML = errorAlert(data.error || 'Unknown error');
     }
   } catch (err) {
     alert.innerHTML = errorAlert(`Network error: ${err.message}`);
@@ -1550,9 +1517,6 @@ const App = {
       body:    JSON.stringify({ hidden: newHidden }),
     });
     if (!res.ok) return;
-    if (raw) raw.extendedProps.hidden = newHidden;
-    const fcEv = calendar.getEventById(String(_currentEventId));
-    if (fcEv) fcEv.setExtendedProp('hidden', newHidden);
     bootstrap.Modal.getInstance(document.getElementById('eventModal')).hide();
     calendar.refetchEvents();
   },
@@ -1629,7 +1593,7 @@ const App = {
     const labels = [...SELECTED.values()];
     const list = labels.slice(0, 8).map(l => `• ${l}`).join('\n')
       + (labels.length > 8 ? `\n…and ${labels.length - 8} more` : '');
-    if (!confirm(`Delete ${n} event${n !== 1 ? 's' : ''}?\n\n${list}\n\n`
+    if (!confirm(`Delete ${plural(n, 'event')}?\n\n${list}\n\n`
         + 'Their comments and photos will be deleted too. This cannot be undone.')) return;
 
     const btn = document.getElementById('select-delete-btn');
@@ -1715,12 +1679,11 @@ const App = {
     const fmtEnd   = fmtDate(end);
     if (!confirm(`Delete all events from ${fmtStart} to ${fmtEnd}? This cannot be undone.`)) return;
 
-    const res  = await fetch('/api/events/clear', {
+    await fetch('/api/events/clear', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ start, end }),
     });
-    const data = await res.json();
     bootstrap.Modal.getInstance(document.getElementById('clearModal')).hide();
     calendar.refetchEvents();
     refreshBadge();
@@ -1891,7 +1854,6 @@ const App = {
 
 };
 
-// ── Utilities ─────────────────────────────────────────────────────────────
 // ── Legend ────────────────────────────────────────────────────────────────
 function buildLegend(fcEvents) {
   // Collect unique groups: key → { label, color, count }
@@ -1959,20 +1921,26 @@ async function updateClearCount() {
     } else {
       msg.className   = 'clear-count-msg has-events';
       msg.innerHTML   = `<i class="bi bi-exclamation-triangle-fill me-1"></i>
-        <strong>${n} event${n !== 1 ? 's' : ''}</strong> will be permanently deleted
+        <strong>${plural(n, 'event')}</strong> will be permanently deleted
         between <strong>${fmtDate(start)}</strong> and <strong>${fmtDate(end)}</strong>.`;
       btn.disabled  = false;
-      label.textContent = `Clear ${n} event${n !== 1 ? 's' : ''} in range`;
+      label.textContent = `Clear ${plural(n, 'event')} in range`;
     }
     msg.classList.remove('d-none');
   } catch (_) {}
 }
 
+const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+
+// 3, 'event' → "3 events"; 1, 'event' → "1 event"
+function plural(n, word) {
+  return `${n} ${word}${n !== 1 ? 's' : ''}`;
+}
+
 function fmtDate(iso) {
   // "2026-04-30" → "Apr 30, 2026"
   const [y, m, d] = iso.split('-');
-  const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
-  return `${months[parseInt(m) - 1]} ${parseInt(d)}, ${y}`;
+  return `${MONTHS[+m - 1]} ${+d}, ${y}`;
 }
 
 // Compact date range for a booking. Collapses shared year/month:
@@ -1983,11 +1951,10 @@ function fmtDate(iso) {
 function fmtDateRange(minIso, maxIso) {
   if (!minIso) return '';
   if (!maxIso || minIso === maxIso) return fmtDate(minIso);
-  const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
   const [y1, m1, d1] = minIso.split('-');
   const [y2, m2, d2] = maxIso.split('-');
-  if (y1 === y2 && m1 === m2) return `${months[+m1 - 1]} ${+d1}–${+d2}, ${y1}`;
-  if (y1 === y2)              return `${months[+m1 - 1]} ${+d1} – ${months[+m2 - 1]} ${+d2}, ${y1}`;
+  if (y1 === y2 && m1 === m2) return `${MONTHS[+m1 - 1]} ${+d1}–${+d2}, ${y1}`;
+  if (y1 === y2)              return `${MONTHS[+m1 - 1]} ${+d1} – ${MONTHS[+m2 - 1]} ${+d2}, ${y1}`;
   return `${fmtDate(minIso)} – ${fmtDate(maxIso)}`;
 }
 

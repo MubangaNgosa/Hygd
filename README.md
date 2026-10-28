@@ -13,7 +13,10 @@ No external API or cloud service required. Everything runs locally on your Linux
 - **Room layouts** — when a report embeds a *Room Set Diagram*, Hygd extracts it as a screenshot and shows it right inside the event popup
 - **Calendar view** — month, week, day, and agenda views via FullCalendar
 - **Click any event** to see its full setup details and layout diagram in a modal popup
-- **Color-coded** — each unique event name gets a consistent colour across all its rooms
+- **Color-coded** — each booking gets a consistent colour across all its rooms
+- **Filters & views** — department chips, search, a *Grouped* view by client booking, hide events for everyone, collapse past events, multi-select delete
+- **Checklists & comments** — tick off setup items, mark events complete, and leave attributed comments (with photos and emoji reactions); a header inbox shows new comments
+- **Analytics** (`/analytics`) — per-semester charts and tables; **Comments report** (`/comments/report`) — printable or CSV
 
 ### Supported PDF formats (auto-detected)
 
@@ -22,16 +25,6 @@ No external API or cloud service required. Everything runs locally on your Linux
 | **Daily Resources by Space - All Functions** | space-grouped, fixed-width columns, embedded layout diagrams |
 | Daily Resources by Setup Time | date-grouped |
 | Services by Function Date | one function per page |
-
----
-
-## Changelog
-
-### 2026-07-30 — Checkpoint: layout diagrams match the correct event
-
-- **Room-layout diagrams now attach to the right event.** Each embedded *Room Set Diagram* is paired to an event by its **position in the document** — the diagram is attached to the event whose row it chronologically follows (the one sharing that event name and booking number), including diagrams that overflow onto the next page.
-- Replaces the previous index-based pairing, which drifted out of sync whenever a room-set event carried no image, or an image had no explicit "Room Set Diagram" line — cascading every following diagram onto the wrong event.
-- Verified end-to-end against the full 246-page *Daily Resources by Space* report: all 49 embedded diagrams resolve to the correct room/event.
 
 ---
 
@@ -51,18 +44,24 @@ No external API or cloud service required. Everything runs locally on your Linux
 
 ```
 hygd/
-├── app.py              # Flask routes (upload, events API, layouts)
+├── app.py              # Flask routes (upload, events/notes API, reports)
 ├── parser.py           # PDF text extraction + event parsing (3 formats)
 ├── database.py         # SQLite read/write helpers
+├── analytics.py        # Semester aggregation + department buckets
 ├── requirements.txt    # Python dependencies
 ├── .env.example        # Template for environment variables
 ├── templates/
-│   └── index.html      # Single-page frontend
+│   ├── index.html      # Calendar page
+│   ├── analytics.html  # Analytics page
+│   └── comments_report.html
 ├── static/
 │   ├── style.css       # Brand styling (Hygd indigo, light + dark)
-│   └── app.js          # Calendar, filters, grouped view, event modal
+│   ├── app.js          # Calendar, filters, grouped view, event modal, comments
+│   └── analytics.js    # Analytics charts
+├── tests/              # python -m pytest tests
 ├── uploads/            # Uploaded PDFs, deleted after 90 days (auto-created)
-│   └── layouts/        # Extracted room-layout diagram PNGs (auto-created)
+│   ├── layouts/        # Extracted room-layout diagram PNGs (auto-created)
+│   └── note_images/    # Photos attached to comments (auto-created)
 └── events.db           # SQLite database (auto-created on first run)
 ```
 
@@ -70,13 +69,9 @@ hygd/
 
 ## Run it locally (Windows)
 
-You only need **Python 3.10+**. All commands are run from the project folder
-(`C:\Users\muban\PycharmProjects\amanda`).
+You only need **Python 3.10+**. All commands are run from the project folder.
 
 ### 1. First time only — create the virtual environment
-
-This repo already ships with a `.venv`, so you can usually skip straight to
-step 2. If you ever need to rebuild it:
 
 ```powershell
 python -m venv .venv
@@ -113,7 +108,7 @@ http://localhost:5000
 
 1. Click **Upload PDF** (top-right) and drop in a MECS daily resource report
    (e.g. *Daily Resources by Space - All Functions*).
-2. The day agenda fills in. Use the **Department** chips and **Room** dropdown to
+2. The day agenda fills in. Use the **Department** chips and the search box to
    filter, **Grouped** to view by client booking, or click any event for full
    detail and its room-layout screenshot.
 
@@ -125,7 +120,7 @@ Press **Ctrl + C** in the terminal. That releases port 5000.
 > ```powershell
 > Get-NetTCPConnection -LocalPort 5000 -State Listen | ForEach-Object { Stop-Process -Id $_.OwningProcess -Force }
 > ```
-> …or change the port at the bottom of `app.py` (`app.run(..., port=5000)`).
+> …or start it on another port: `$env:PORT=5001; python app.py`.
 
 ### Notes
 
@@ -154,7 +149,7 @@ sudo apt update && sudo apt install -y python3 python3-venv python3-full nginx
 > "externally managed", so a bare `pip install` fails with an
 > `externally-managed-environment` error. Always install inside the virtual
 > environment created in step 3 — never system-wide. (nginx is only needed if you
-> want port 80; skip it for a quick `:5000` run.)
+> want port 80; skip it and use `:8000` directly.)
 
 ### 2. Copy the project to the server
 
@@ -166,11 +161,10 @@ fresh one on the server in the next step.
 rsync -av \
   --exclude '.venv' --exclude '__pycache__' --exclude '*.pyc' \
   --exclude 'uploads/' --exclude 'events.db' --exclude '.idea' \
-  /c/Users/muban/PycharmProjects/amanda/ \
-  youruser@your-server-ip:/opt/hygd/
+  ./ youruser@your-server-ip:/opt/hygd/
 ```
 
-> Replace `youruser` and `your-server-ip` with your actual Linux username and
+> Run it from the project folder. Replace `youruser` and `your-server-ip` with your actual Linux username and
 > server's LAN IP address. No `rsync`? Use `scp -r` or a `git clone` instead.
 
 ### 3. Create a Python virtual environment
@@ -187,16 +181,14 @@ pip install -r requirements.txt
 ```bash
 cd /opt/hygd
 source .venv/bin/activate
-HOST=0.0.0.0 python app.py
+HOST=0.0.0.0 PORT=8000 python app.py
 ```
 
-Open `http://your-server-ip:5000` in a browser. If the calendar loads, press `Ctrl+C` and continue to the next step.
+Open `http://your-server-ip:8000` in a browser. If the calendar loads, press `Ctrl+C` and continue to the next step.
 
-> **Port 5000 already in use?** (Common on a shared server.) Either pick another
-> port — `PORT=8000 python app.py`, or with Gunicorn:
-> `gunicorn -w 2 -b 0.0.0.0:8000 app:app` — or find what's using it with
-> `sudo ss -ltnp | grep :5000`. If you change the port, use the same one in the
-> systemd `ExecStart` and the nginx `proxy_pass` below, and open it in `ufw`.
+> **Port 8000 already in use?** Find what's using it with `sudo ss -ltnp | grep :8000`,
+> or pick another port and use it in the systemd `ExecStart`, the nginx
+> `proxy_pass` and `ufw` below.
 
 ### 5. Create a systemd service (auto-start on boot)
 
@@ -214,7 +206,7 @@ After=network.target
 [Service]
 User=youruser
 WorkingDirectory=/opt/hygd
-ExecStart=/opt/hygd/.venv/bin/gunicorn -w 2 -b 0.0.0.0:5000 app:app
+ExecStart=/opt/hygd/.venv/bin/gunicorn -w 2 -b 0.0.0.0:8000 app:app
 Restart=always
 RestartSec=5
 
@@ -235,7 +227,7 @@ You should see `Active: active (running)`.
 
 ### 6. Set up nginx (access on port 80)
 
-This step lets you reach the app at `http://your-server-ip` instead of `http://your-server-ip:5000`.
+This step lets you reach the app at `http://your-server-ip` instead of `http://your-server-ip:8000`.
 
 ```bash
 sudo nano /etc/nginx/sites-available/hygd
@@ -251,7 +243,7 @@ server {
     client_max_body_size 50M;
 
     location / {
-        proxy_pass         http://127.0.0.1:5000;
+        proxy_pass         http://127.0.0.1:8000;
         proxy_set_header   Host $host;
         proxy_set_header   X-Real-IP $remote_addr;
         proxy_read_timeout 120s;
@@ -283,13 +275,13 @@ The app is now live at `http://your-server-ip`.
 
    ```bash
    sudo ufw allow 80/tcp      # if you set up nginx (step 6)
-   sudo ufw allow 5000/tcp    # if you're running the app directly (no nginx)
+   sudo ufw allow 8000/tcp    # if you're running the app directly (no nginx)
    ```
 
 3. **On your phone** (connected to the same Wi-Fi/LAN), open:
 
    - With nginx:      `http://192.168.1.50`
-   - Without nginx:   `http://192.168.1.50:5000`
+   - Without nginx:   `http://192.168.1.50:8000`
 
 > Gunicorn binds to `0.0.0.0`, so it already accepts connections from other
 > devices — you only need the correct IP and an open firewall port. This is
@@ -299,12 +291,7 @@ The app is now live at `http://your-server-ip`.
 
 ## Daily use
 
-1. Open the app in your browser
-2. Click **Upload PDF** in the top-right corner
-3. Drop in the latest MECS daily resource PDF
-4. Events appear on the calendar instantly — click any one for full setup details
-
-> Uploading a new PDF **adds** to existing events. Use the **Clear** button first if you want to replace the calendar entirely with the new file.
+Upload the latest MECS report with **Upload PDF** (see *Load some events* above).
 
 > Uploaded PDFs in `uploads/` are deleted after 90 days (checked on each upload); the events stay in the database. Note photos (`uploads/note_images/`) and layout diagrams (`uploads/layouts/`) are kept.
 
@@ -314,26 +301,11 @@ The app is now live at `http://your-server-ip`.
 
 When you make changes to the code on your Windows machine, push them to the server with rsync and restart the service.
 
-**From your Windows machine:**
+From your Windows machine (Git Bash or WSL), in the project folder:
 
 ```bash
 rsync -av --exclude '__pycache__' --exclude '*.pyc' --exclude 'uploads/' --exclude 'events.db' \
-  /c/Users/muban/PycharmProjects/amanda/ \
-  youruser@your-server-ip:/opt/hygd/
-```
-
-**Then on the server (or in the same command):**
-
-```bash
-ssh youruser@your-server-ip "sudo systemctl restart hygd"
-```
-
-Or as a single one-liner from Windows:
-
-```bash
-rsync -av --exclude '__pycache__' --exclude '*.pyc' --exclude 'uploads/' --exclude 'events.db' \
-  /c/Users/muban/PycharmProjects/amanda/ \
-  youruser@your-server-ip:/opt/hygd/ \
+  ./ youruser@your-server-ip:/opt/hygd/ \
   && ssh youruser@your-server-ip "sudo systemctl restart hygd"
 ```
 
@@ -344,12 +316,8 @@ rsync -av --exclude '__pycache__' --exclude '*.pyc' --exclude 'uploads/' --exclu
 ## Useful server commands
 
 ```bash
-# Check if the service is running
+# Status / restart
 sudo systemctl status hygd
-
-# Start / stop / restart
-sudo systemctl start hygd
-sudo systemctl stop hygd
 sudo systemctl restart hygd
 
 # Watch live logs (useful for debugging)
@@ -382,8 +350,6 @@ sudo systemctl restart hygd
 - Run manually to see the error: `cd /opt/hygd && source .venv/bin/activate && python app.py`
 - Check that the path in the `.service` file matches where the project is installed
 
-**Port 5000 already in use**
-- Another process is on that port. Change the port in the `.service` file (`-b 0.0.0.0:5001`) and update the nginx `proxy_pass` to match.
 
 ---
 
